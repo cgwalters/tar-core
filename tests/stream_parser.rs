@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::io::{Cursor, Read};
 
-use tar_core::stream::{Limits, StreamError};
+use tar_core::parse::{Limits, ParseError};
 use tar_core::{EntryType, Header, PaxExtensions, HEADER_SIZE, PAX_SCHILY_XATTR};
 
 // =============================================================================
@@ -100,7 +100,7 @@ pub struct TarStreamParser<R> {
     done: bool,
 }
 
-type Result<T> = std::result::Result<T, StreamError>;
+type Result<T> = std::result::Result<T, ParseError>;
 
 impl<R: Read> TarStreamParser<R> {
     pub fn new(reader: R, limits: Limits) -> Self {
@@ -131,7 +131,7 @@ impl<R: Read> TarStreamParser<R> {
 
         loop {
             if self.pending.count > self.limits.max_pending_entries {
-                return Err(StreamError::TooManyPendingEntries {
+                return Err(ParseError::TooManyPendingEntries {
                     count: self.pending.count,
                     limit: self.limits.max_pending_entries,
                 });
@@ -141,7 +141,7 @@ impl<R: Read> TarStreamParser<R> {
             if !got_header {
                 self.done = true;
                 if !self.pending.is_empty() {
-                    return Err(StreamError::OrphanedMetadata);
+                    return Err(ParseError::OrphanedMetadata);
                 }
                 return Ok(None);
             }
@@ -150,7 +150,7 @@ impl<R: Read> TarStreamParser<R> {
             if self.header_buf.iter().all(|&b| b == 0) {
                 self.done = true;
                 if !self.pending.is_empty() {
-                    return Err(StreamError::OrphanedMetadata);
+                    return Err(ParseError::OrphanedMetadata);
                 }
                 return Ok(None);
             }
@@ -162,7 +162,7 @@ impl<R: Read> TarStreamParser<R> {
             let size = header.entry_size()?;
             let padded_size = size
                 .checked_next_multiple_of(512)
-                .ok_or(StreamError::InvalidSize(size))?;
+                .ok_or(ParseError::InvalidSize(size))?;
 
             match entry_type {
                 EntryType::GnuLongName => {
@@ -201,14 +201,14 @@ impl<R: Read> TarStreamParser<R> {
     pub fn skip_content(&mut self, size: u64) -> Result<()> {
         let padded = size
             .checked_next_multiple_of(512)
-            .ok_or(StreamError::InvalidSize(size))?;
+            .ok_or(ParseError::InvalidSize(size))?;
         self.skip_bytes(padded)
     }
 
     pub fn skip_padding(&mut self, content_size: u64) -> Result<()> {
         let padded = content_size
             .checked_next_multiple_of(512)
-            .ok_or(StreamError::InvalidSize(content_size))?;
+            .ok_or(ParseError::InvalidSize(content_size))?;
         let padding = padded - content_size;
         if padding > 0 {
             self.skip_bytes(padding)?;
@@ -244,10 +244,10 @@ impl<R: Read> TarStreamParser<R> {
 
     fn handle_gnu_long_name(&mut self, size: u64, padded_size: u64) -> Result<()> {
         if self.pending.gnu_long_name.is_some() {
-            return Err(StreamError::DuplicateGnuLongName);
+            return Err(ParseError::DuplicateGnuLongName);
         }
         if size > self.limits.max_gnu_long_size {
-            return Err(StreamError::GnuLongTooLarge {
+            return Err(ParseError::GnuLongTooLarge {
                 size,
                 limit: self.limits.max_gnu_long_size,
             });
@@ -256,7 +256,7 @@ impl<R: Read> TarStreamParser<R> {
         self.skip_bytes(padded_size - size)?;
         data.pop_if(|&mut x| x == 0);
         if data.len() > self.limits.max_path_len {
-            return Err(StreamError::PathTooLong {
+            return Err(ParseError::PathTooLong {
                 len: data.len(),
                 limit: self.limits.max_path_len,
             });
@@ -268,10 +268,10 @@ impl<R: Read> TarStreamParser<R> {
 
     fn handle_gnu_long_link(&mut self, size: u64, padded_size: u64) -> Result<()> {
         if self.pending.gnu_long_link.is_some() {
-            return Err(StreamError::DuplicateGnuLongLink);
+            return Err(ParseError::DuplicateGnuLongLink);
         }
         if size > self.limits.max_gnu_long_size {
-            return Err(StreamError::GnuLongTooLarge {
+            return Err(ParseError::GnuLongTooLarge {
                 size,
                 limit: self.limits.max_gnu_long_size,
             });
@@ -280,7 +280,7 @@ impl<R: Read> TarStreamParser<R> {
         self.skip_bytes(padded_size - size)?;
         data.pop_if(|&mut x| x == 0);
         if data.len() > self.limits.max_path_len {
-            return Err(StreamError::PathTooLong {
+            return Err(ParseError::PathTooLong {
                 len: data.len(),
                 limit: self.limits.max_path_len,
             });
@@ -292,10 +292,10 @@ impl<R: Read> TarStreamParser<R> {
 
     fn handle_pax_header(&mut self, size: u64, padded_size: u64) -> Result<()> {
         if self.pending.pax_extensions.is_some() {
-            return Err(StreamError::DuplicatePaxHeader);
+            return Err(ParseError::DuplicatePaxHeader);
         }
         if size > self.limits.max_pax_size {
-            return Err(StreamError::PaxTooLarge {
+            return Err(ParseError::PaxTooLarge {
                 size,
                 limit: self.limits.max_pax_size,
             });
@@ -356,13 +356,13 @@ impl<R: Read> TarStreamParser<R> {
 
             for ext in extensions {
                 let ext = ext?;
-                let key = ext.key().map_err(StreamError::from)?;
+                let key = ext.key().map_err(ParseError::from)?;
                 let value = ext.value_bytes();
 
                 match key {
                     "path" => {
                         if value.len() > self.limits.max_path_len {
-                            return Err(StreamError::PathTooLong {
+                            return Err(ParseError::PathTooLong {
                                 len: value.len(),
                                 limit: self.limits.max_path_len,
                             });
@@ -371,7 +371,7 @@ impl<R: Read> TarStreamParser<R> {
                     }
                     "linkpath" => {
                         if value.len() > self.limits.max_path_len {
-                            return Err(StreamError::PathTooLong {
+                            return Err(ParseError::PathTooLong {
                                 len: value.len(),
                                 limit: self.limits.max_path_len,
                             });
@@ -427,7 +427,7 @@ impl<R: Read> TarStreamParser<R> {
         }
 
         if path.len() > self.limits.max_path_len {
-            return Err(StreamError::PathTooLong {
+            return Err(ParseError::PathTooLong {
                 len: path.len(),
                 limit: self.limits.max_path_len,
             });
@@ -461,7 +461,7 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<bool> {
                 if total == 0 {
                     return Ok(false);
                 }
-                return Err(StreamError::UnexpectedEof { pos: 0 });
+                return Err(ParseError::UnexpectedEof { pos: 0 });
             }
             Ok(n) => total += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -754,7 +754,7 @@ fn test_path_too_long() {
     let err = parser.next_entry().unwrap_err();
     assert!(matches!(
         err,
-        StreamError::PathTooLong {
+        ParseError::PathTooLong {
             len: 200,
             limit: 100
         }
@@ -776,7 +776,7 @@ fn test_gnu_long_too_large() {
     let mut parser = TarStreamParser::new(Cursor::new(data), limits);
 
     let err = parser.next_entry().unwrap_err();
-    assert!(matches!(err, StreamError::GnuLongTooLarge { .. }));
+    assert!(matches!(err, ParseError::GnuLongTooLarge { .. }));
 }
 
 // =============================================================================

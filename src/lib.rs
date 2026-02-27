@@ -76,12 +76,11 @@
 //! # Parsing
 //!
 //! For parsing complete tar archives with automatic handling of GNU and PAX
-//! extensions, see the sans-IO [`parse`] module. The [`stream`] module provides
-//! shared types ([`stream::Limits`], [`stream::StreamError`]) used by parsers.
+//! extensions, see the sans-IO [`parse`] module. It also contains security
+//! [`parse::Limits`] and the [`parse::ParseError`] type.
 
 pub mod builder;
 pub mod parse;
-pub mod stream;
 
 pub use builder::{
     blocks_for_size, EntryBuilder, ExtensionMode, HeaderBuilder, PaxBuilder, LINKNAME_MAX_LEN,

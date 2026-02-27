@@ -1,12 +1,279 @@
-//! Sans-IO state machine parser for tar archives.
+//! Sans-IO tar archive parser.
+//!
+//! This module provides a sans-IO state machine parser for tar archives.
+//! It operates on `&[u8]` slices directly (no `Read` trait bound), making
+//! it suitable for:
+//!
+//! - Async I/O (tokio, async-std)
+//! - Custom buffering strategies
+//! - Zero-copy parsing in memory-mapped archives
+//! - Embedding in other parsers
+//!
+//! In addition to the parser itself, this module contains the configuration
+//! and error types it uses: [`Limits`] for security limits and [`ParseError`]
+//! for error reporting.
+//!
+//! # Design
+//!
+//! The parser is a state machine that processes bytes and emits [`ParseEvent`]s.
+//! The caller is responsible for:
+//!
+//! 1. Providing input data via [`Parser::parse`]
+//! 2. Handling events (headers, content markers, end-of-archive)
+//! 3. Managing the buffer and reading more data when needed
+//!
+//! # Example
+//!
+//! ```
+//! use tar_core::parse::{Parser, ParseEvent, Limits};
+//!
+//! let mut parser = Parser::new(Limits::default());
+//!
+//! // Simulated tar data (in practice, read from file/network)
+//! let data = [0u8; 1024]; // Two zero blocks = end of archive
+//!
+//! match parser.parse(&data) {
+//!     Ok(ParseEvent::End { consumed }) => {
+//!         println!("End of archive after {} bytes", consumed);
+//!     }
+//!     Ok(event) => {
+//!         println!("Got event {:?}", event);
+//!     }
+//!     Err(e) => {
+//!         eprintln!("Parse error: {}", e);
+//!     }
+//! }
+//! ```
 
 use std::borrow::Cow;
+use std::str::Utf8Error;
 
-use crate::stream::{Limits, StreamError};
-use crate::{EntryType, Header, PaxExtensions, HEADER_SIZE, PAX_SCHILY_XATTR};
+use thiserror::Error;
 
-/// Result type for sans-IO parsing operations.
-type Result<T> = std::result::Result<T, StreamError>;
+use crate::{
+    EntryType, Header, HeaderError, PaxError, PaxExtensions, HEADER_SIZE, PAX_SCHILY_XATTR,
+};
+
+// ============================================================================
+// Limits
+// ============================================================================
+
+/// Configurable security limits for tar archive parsing.
+///
+/// These limits protect against malicious or malformed archives that could
+/// exhaust memory or create excessively long paths.
+///
+/// # Example
+///
+/// ```
+/// use tar_core::parse::Limits;
+///
+/// // Use defaults
+/// let limits = Limits::default();
+///
+/// // Customize limits
+/// let strict_limits = Limits {
+///     max_path_len: 1024,
+///     max_pax_size: 64 * 1024,
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum path length in bytes.
+    ///
+    /// Applies to both file paths and link targets. Paths exceeding this
+    /// limit will cause a [`ParseError::PathTooLong`] error.
+    ///
+    /// Default: 4096 bytes (Linux PATH_MAX).
+    pub max_path_len: usize,
+
+    /// Maximum size of PAX extended header data in bytes.
+    ///
+    /// This limits the total size of a single PAX 'x' entry's content.
+    /// PAX headers larger than this will cause a [`ParseError::PaxTooLarge`] error.
+    ///
+    /// Default: 1 MiB (1,048,576 bytes).
+    pub max_pax_size: u64,
+
+    /// Maximum size of GNU long name/link data in bytes.
+    ///
+    /// GNU 'L' (long name) and 'K' (long link) entries should only contain
+    /// a single path. Values exceeding this limit will cause a
+    /// [`ParseError::GnuLongTooLarge`] error.
+    ///
+    /// Default: 4096 bytes.
+    pub max_gnu_long_size: u64,
+
+    /// Maximum number of consecutive metadata entries before an actual entry.
+    ///
+    /// Prevents infinite loops from malformed archives that contain only
+    /// metadata entries (GNU long name, PAX headers) without actual file entries.
+    /// Exceeding this limit will cause a [`ParseError::TooManyPendingEntries`] error.
+    ///
+    /// Default: 16 entries.
+    pub max_pending_entries: usize,
+
+    /// When true, PAX extension values that fail to parse (invalid UTF-8,
+    /// invalid integer for numeric fields like `uid`, `gid`, `size`, `mtime`)
+    /// cause errors instead of being silently ignored.
+    ///
+    /// Default: `true`.
+    pub strict: bool,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_path_len: 4096,
+            max_pax_size: 1024 * 1024, // 1 MiB
+            max_gnu_long_size: 4096,
+            max_pending_entries: 16,
+            strict: true,
+        }
+    }
+}
+
+impl Limits {
+    /// Create a new `Limits` with default values.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create permissive limits suitable for trusted archives.
+    ///
+    /// This sets very high limits that effectively disable most checks.
+    /// Only use this for archives from trusted sources.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self {
+            max_path_len: usize::MAX,
+            max_pax_size: u64::MAX,
+            max_gnu_long_size: u64::MAX,
+            max_pending_entries: usize::MAX,
+            strict: false,
+        }
+    }
+
+    /// Create strict limits suitable for untrusted archives.
+    ///
+    /// This sets conservative limits to minimize resource consumption
+    /// from potentially malicious archives.
+    #[must_use]
+    pub fn strict() -> Self {
+        Self {
+            max_path_len: 1024,
+            max_pax_size: 64 * 1024, // 64 KiB
+            max_gnu_long_size: 1024,
+            max_pending_entries: 8,
+            strict: true,
+        }
+    }
+}
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+/// Errors that can occur during tar archive parsing.
+#[derive(Debug, Error)]
+pub enum ParseError {
+    /// I/O error from the underlying reader.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Header parsing error (checksum, invalid octal, etc.).
+    #[error("header error: {0}")]
+    Header(#[from] HeaderError),
+
+    /// PAX extension parsing error.
+    #[error("PAX error: {0}")]
+    Pax(#[from] PaxError),
+
+    /// Invalid UTF-8 in PAX key.
+    #[error("invalid UTF-8 in PAX key: {0}")]
+    InvalidUtf8(#[from] Utf8Error),
+
+    /// Path exceeds configured maximum length.
+    #[error("path exceeds limit: {len} bytes > {limit} bytes")]
+    PathTooLong {
+        /// Actual path length.
+        len: usize,
+        /// Configured limit.
+        limit: usize,
+    },
+
+    /// PAX extended header exceeds configured maximum size.
+    #[error("PAX header exceeds limit: {size} bytes > {limit} bytes")]
+    PaxTooLarge {
+        /// Actual PAX header size.
+        size: u64,
+        /// Configured limit.
+        limit: u64,
+    },
+
+    /// GNU long name/link exceeds configured maximum size.
+    #[error("GNU long name/link exceeds limit: {size} bytes > {limit} bytes")]
+    GnuLongTooLarge {
+        /// Actual GNU long name/link size.
+        size: u64,
+        /// Configured limit.
+        limit: u64,
+    },
+
+    /// Duplicate GNU long name entry without an intervening actual entry.
+    #[error("duplicate GNU long name entry")]
+    DuplicateGnuLongName,
+
+    /// Duplicate GNU long link entry without an intervening actual entry.
+    #[error("duplicate GNU long link entry")]
+    DuplicateGnuLongLink,
+
+    /// Duplicate PAX extended header without an intervening actual entry.
+    #[error("duplicate PAX extended header")]
+    DuplicatePaxHeader,
+
+    /// Metadata entries (GNU long name, PAX, etc.) found but no actual entry followed.
+    #[error("metadata entries without a following actual entry")]
+    OrphanedMetadata,
+
+    /// Too many consecutive metadata entries (possible infinite loop or malicious archive).
+    #[error("too many pending metadata entries: {count} > {limit}")]
+    TooManyPendingEntries {
+        /// Number of pending metadata entries.
+        count: usize,
+        /// Configured limit.
+        limit: usize,
+    },
+
+    /// A PAX extension value failed to parse in strict mode.
+    #[error("invalid PAX {key} value: {value:?}")]
+    InvalidPaxValue {
+        /// The PAX key (e.g. "uid", "size").
+        key: &'static str,
+        /// The raw value string.
+        value: String,
+    },
+
+    /// Entry size in header is invalid (e.g., overflow when computing padded size).
+    #[error("invalid entry size: {0}")]
+    InvalidSize(u64),
+
+    /// Unexpected EOF while reading entry content or padding.
+    #[error("unexpected EOF at position {pos}")]
+    UnexpectedEof {
+        /// Position in the stream where EOF occurred.
+        pos: u64,
+    },
+}
+
+/// Result type for parsing operations.
+pub type Result<T> = std::result::Result<T, ParseError>;
+
+// ============================================================================
+// Parser
+// ============================================================================
 
 /// Events emitted by the sans-IO parser.
 #[derive(Debug)]
@@ -372,7 +639,7 @@ impl Parser {
             if self.zero_blocks >= 2 {
                 self.state = State::Done;
                 if !self.pending.is_empty() {
-                    return Err(StreamError::OrphanedMetadata);
+                    return Err(ParseError::OrphanedMetadata);
                 }
                 return Ok(ParseEvent::End {
                     consumed: HEADER_SIZE,
@@ -389,7 +656,7 @@ impl Parser {
             if second_block.iter().all(|&b| b == 0) {
                 self.state = State::Done;
                 if !self.pending.is_empty() {
-                    return Err(StreamError::OrphanedMetadata);
+                    return Err(ParseError::OrphanedMetadata);
                 }
                 return Ok(ParseEvent::End {
                     consumed: 2 * HEADER_SIZE,
@@ -407,7 +674,7 @@ impl Parser {
 
         // Check pending entry limit
         if self.pending.count > self.limits.max_pending_entries {
-            return Err(StreamError::TooManyPendingEntries {
+            return Err(ParseError::TooManyPendingEntries {
                 count: self.pending.count,
                 limit: self.limits.max_pending_entries,
             });
@@ -421,7 +688,7 @@ impl Parser {
         let size = header.entry_size()?;
         let padded_size = size
             .checked_next_multiple_of(HEADER_SIZE as u64)
-            .ok_or(StreamError::InvalidSize(size))?;
+            .ok_or(ParseError::InvalidSize(size))?;
 
         // Handle metadata entry types
         match entry_type {
@@ -455,12 +722,12 @@ impl Parser {
     ) -> Result<ParseEvent<'a>> {
         // Check for duplicate
         if self.pending.gnu_long_name.is_some() {
-            return Err(StreamError::DuplicateGnuLongName);
+            return Err(ParseError::DuplicateGnuLongName);
         }
 
         // Check size limit
         if size > self.limits.max_gnu_long_size {
-            return Err(StreamError::GnuLongTooLarge {
+            return Err(ParseError::GnuLongTooLarge {
                 size,
                 limit: self.limits.max_gnu_long_size,
             });
@@ -485,7 +752,7 @@ impl Parser {
 
         // Check path length
         if data.len() > self.limits.max_path_len {
-            return Err(StreamError::PathTooLong {
+            return Err(ParseError::PathTooLong {
                 len: data.len(),
                 limit: self.limits.max_path_len,
             });
@@ -507,12 +774,12 @@ impl Parser {
     ) -> Result<ParseEvent<'a>> {
         // Check for duplicate
         if self.pending.gnu_long_link.is_some() {
-            return Err(StreamError::DuplicateGnuLongLink);
+            return Err(ParseError::DuplicateGnuLongLink);
         }
 
         // Check size limit
         if size > self.limits.max_gnu_long_size {
-            return Err(StreamError::GnuLongTooLarge {
+            return Err(ParseError::GnuLongTooLarge {
                 size,
                 limit: self.limits.max_gnu_long_size,
             });
@@ -537,7 +804,7 @@ impl Parser {
 
         // Check path length
         if data.len() > self.limits.max_path_len {
-            return Err(StreamError::PathTooLong {
+            return Err(ParseError::PathTooLong {
                 len: data.len(),
                 limit: self.limits.max_path_len,
             });
@@ -559,12 +826,12 @@ impl Parser {
     ) -> Result<ParseEvent<'a>> {
         // Check for duplicate
         if self.pending.pax_extensions.is_some() {
-            return Err(StreamError::DuplicatePaxHeader);
+            return Err(ParseError::DuplicatePaxHeader);
         }
 
         // Check size limit
         if size > self.limits.max_pax_size {
-            return Err(StreamError::PaxTooLarge {
+            return Err(ParseError::PaxTooLarge {
                 size,
                 limit: self.limits.max_pax_size,
             });
@@ -640,7 +907,7 @@ impl Parser {
                         Ok(s) => s,
                         Err(_) if !strict => return Ok(None),
                         Err(_) => {
-                            return Err(StreamError::InvalidPaxValue {
+                            return Err(ParseError::InvalidPaxValue {
                                 key,
                                 value: String::from_utf8_lossy(ext.value_bytes()).into(),
                             })
@@ -649,7 +916,7 @@ impl Parser {
                     match s.parse::<u64>() {
                         Ok(v) => Ok(Some(v)),
                         Err(_) if !strict => Ok(None),
-                        Err(_) => Err(StreamError::InvalidPaxValue {
+                        Err(_) => Err(ParseError::InvalidPaxValue {
                             key,
                             value: s.into(),
                         }),
@@ -658,13 +925,13 @@ impl Parser {
 
             for ext in extensions {
                 let ext = ext?;
-                let key = ext.key().map_err(StreamError::from)?;
+                let key = ext.key().map_err(ParseError::from)?;
                 let value = ext.value_bytes();
 
                 match key {
                     "path" => {
                         if value.len() > self.limits.max_path_len {
-                            return Err(StreamError::PathTooLong {
+                            return Err(ParseError::PathTooLong {
                                 len: value.len(),
                                 limit: self.limits.max_path_len,
                             });
@@ -673,7 +940,7 @@ impl Parser {
                     }
                     "linkpath" => {
                         if value.len() > self.limits.max_path_len {
-                            return Err(StreamError::PathTooLong {
+                            return Err(ParseError::PathTooLong {
                                 len: value.len(),
                                 limit: self.limits.max_path_len,
                             });
@@ -702,7 +969,7 @@ impl Parser {
                             Ok(s) => s,
                             Err(_) if !strict => continue,
                             Err(_) => {
-                                return Err(StreamError::InvalidPaxValue {
+                                return Err(ParseError::InvalidPaxValue {
                                     key: "mtime",
                                     value: String::from_utf8_lossy(value).into(),
                                 })
@@ -713,7 +980,7 @@ impl Parser {
                             Ok(v) => mtime = v,
                             Err(_) if !strict => {}
                             Err(_) => {
-                                return Err(StreamError::InvalidPaxValue {
+                                return Err(ParseError::InvalidPaxValue {
                                     key: "mtime",
                                     value: s.into(),
                                 })
@@ -743,7 +1010,7 @@ impl Parser {
 
         // Validate final path length
         if path.len() > self.limits.max_path_len {
-            return Err(StreamError::PathTooLong {
+            return Err(ParseError::PathTooLong {
                 len: path.len(),
                 limit: self.limits.max_path_len,
             });
@@ -783,6 +1050,29 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_limits() {
+        let limits = Limits::default();
+        assert_eq!(limits.max_path_len, 4096);
+        assert_eq!(limits.max_pax_size, 1024 * 1024);
+        assert_eq!(limits.max_gnu_long_size, 4096);
+        assert_eq!(limits.max_pending_entries, 16);
+    }
+
+    #[test]
+    fn test_permissive_limits() {
+        let limits = Limits::permissive();
+        assert_eq!(limits.max_path_len, usize::MAX);
+        assert_eq!(limits.max_pax_size, u64::MAX);
+    }
+
+    #[test]
+    fn test_strict_limits() {
+        let limits = Limits::strict();
+        assert!(limits.max_path_len < Limits::default().max_path_len);
+        assert!(limits.max_pax_size < Limits::default().max_pax_size);
+    }
 
     #[test]
     fn test_parser_empty_archive() {
@@ -1308,7 +1598,7 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(StreamError::OrphanedMetadata)));
+        assert!(matches!(result, Err(ParseError::OrphanedMetadata)));
     }
 
     #[test]
@@ -1321,7 +1611,7 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(StreamError::OrphanedMetadata)));
+        assert!(matches!(result, Err(ParseError::OrphanedMetadata)));
     }
 
     #[test]
@@ -1336,7 +1626,7 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(StreamError::DuplicateGnuLongName)));
+        assert!(matches!(result, Err(ParseError::DuplicateGnuLongName)));
     }
 
     #[test]
@@ -1351,7 +1641,7 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(StreamError::DuplicateGnuLongLink)));
+        assert!(matches!(result, Err(ParseError::DuplicateGnuLongLink)));
     }
 
     #[test]
@@ -1366,7 +1656,7 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(StreamError::DuplicatePaxHeader)));
+        assert!(matches!(result, Err(ParseError::DuplicatePaxHeader)));
     }
 
     // =========================================================================
@@ -1522,7 +1812,7 @@ mod tests {
         let mut parser = Parser::new(limits);
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(StreamError::GnuLongTooLarge { .. })));
+        assert!(matches!(result, Err(ParseError::GnuLongTooLarge { .. })));
     }
 
     #[test]
@@ -1543,7 +1833,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(StreamError::PathTooLong {
+            Err(ParseError::PathTooLong {
                 len: 200,
                 limit: 100
             })
@@ -1567,7 +1857,7 @@ mod tests {
         let mut parser = Parser::new(limits);
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(StreamError::PaxTooLarge { .. })));
+        assert!(matches!(result, Err(ParseError::PaxTooLarge { .. })));
     }
 
     // =========================================================================
@@ -1742,7 +2032,7 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let err = parser.parse(&archive).unwrap_err();
         assert!(
-            matches!(err, StreamError::InvalidPaxValue { key: "uid", .. }),
+            matches!(err, ParseError::InvalidPaxValue { key: "uid", .. }),
             "expected InvalidPaxValue for uid, got {err:?}"
         );
     }
@@ -1754,7 +2044,7 @@ mod tests {
         let err = parser.parse(&archive).unwrap_err();
         assert!(matches!(
             err,
-            StreamError::InvalidPaxValue { key: "size", .. }
+            ParseError::InvalidPaxValue { key: "size", .. }
         ));
     }
 
@@ -1765,7 +2055,7 @@ mod tests {
         let err = parser.parse(&archive).unwrap_err();
         assert!(matches!(
             err,
-            StreamError::InvalidPaxValue { key: "gid", .. }
+            ParseError::InvalidPaxValue { key: "gid", .. }
         ));
     }
 
@@ -1776,7 +2066,7 @@ mod tests {
         let err = parser.parse(&archive).unwrap_err();
         assert!(matches!(
             err,
-            StreamError::InvalidPaxValue { key: "mtime", .. }
+            ParseError::InvalidPaxValue { key: "mtime", .. }
         ));
     }
 
