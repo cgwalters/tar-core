@@ -4362,3 +4362,214 @@ mod tests {
         }
     }
 }
+
+// ============================================================================
+// Kani Formal Verification Proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // =========================================================================
+    // truncate_null: prove panic freedom for all byte slices up to 16 bytes
+    // =========================================================================
+
+    #[kani::proof]
+    fn check_truncate_null_panic_freedom() {
+        let bytes: [u8; 16] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= bytes.len());
+        let slice = &bytes[..len];
+        let result = truncate_null(slice);
+        // Result must be a subslice (length <= input length)
+        kani::assert(result.len() <= slice.len(), "result within bounds");
+    }
+
+    #[kani::proof]
+    fn check_truncate_null_empty() {
+        let result = truncate_null(b"");
+        kani::assert(result.is_empty(), "empty input gives empty output");
+    }
+
+    // =========================================================================
+    // parse_octal: prove panic freedom for arbitrary 8-byte and 12-byte fields
+    //
+    // These are the actual field sizes used in tar headers (mode/uid/gid are 8,
+    // size/mtime are 12). Proving panic freedom here means parse_octal cannot
+    // crash on any possible byte content in a tar header field.
+    // =========================================================================
+
+    #[kani::proof]
+    fn check_parse_octal_8byte_panic_freedom() {
+        let bytes: [u8; 8] = kani::any();
+        // Must not panic; result is either Ok or Err
+        let _ = parse_octal(&bytes);
+    }
+
+    #[kani::proof]
+    fn check_parse_octal_12byte_panic_freedom() {
+        let bytes: [u8; 12] = kani::any();
+        let _ = parse_octal(&bytes);
+    }
+
+    #[kani::proof]
+    fn check_parse_octal_empty() {
+        let result = parse_octal(&[]);
+        kani::assert(result.is_ok(), "empty input returns Ok");
+        kani::assert(result.unwrap() == 0, "empty input returns 0");
+    }
+
+    // =========================================================================
+    // encode_octal: prove panic freedom and roundtrip for 8-byte fields
+    //
+    // An 8-byte field has 7 octal digits, so max value is 0o7777777 = 2097151.
+    // We verify that encoding any value in [0, 2097151] does not panic, and
+    // that decoding the result gives back the original value.
+    // =========================================================================
+
+    #[kani::proof]
+    fn check_encode_octal_8byte_panic_freedom() {
+        let value: u64 = kani::any();
+        let mut field = [0u8; 8];
+        // Must not panic regardless of value (returns Err for overflow)
+        let _ = encode_octal(&mut field, value);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn check_encode_octal_8byte_roundtrip() {
+        let value: u64 = kani::any();
+        // 7 octal digits fit values 0..=2097151
+        kani::assume(value <= 0o7777777);
+        let mut field = [0u8; 8];
+        let result = encode_octal(&mut field, value);
+        kani::assert(result.is_ok(), "value in range should encode successfully");
+        let decoded = parse_octal(&field).unwrap();
+        kani::assert(decoded == value, "roundtrip must preserve value");
+    }
+
+    // =========================================================================
+    // encode_octal: prove panic freedom for 12-byte fields
+    // =========================================================================
+
+    #[kani::proof]
+    fn check_encode_octal_12byte_panic_freedom() {
+        let value: u64 = kani::any();
+        let mut field = [0u8; 12];
+        let _ = encode_octal(&mut field, value);
+    }
+
+    #[kani::proof]
+    fn check_encode_octal_empty_field() {
+        let value: u64 = kani::any();
+        let mut field = [0u8; 0];
+        let result = encode_octal(&mut field, value);
+        kani::assert(result.is_err(), "empty field always fails");
+    }
+
+    // =========================================================================
+    // parse_numeric: prove panic freedom for arbitrary 8 and 12 byte fields
+    //
+    // parse_numeric handles both octal ASCII and GNU base-256 encoding. This is
+    // the function actually called on untrusted tar header data, so proving it
+    // cannot panic for any byte pattern is the highest-value proof here.
+    // =========================================================================
+
+    #[kani::proof]
+    fn check_parse_numeric_8byte_panic_freedom() {
+        let bytes: [u8; 8] = kani::any();
+        let _ = parse_numeric(&bytes);
+    }
+
+    #[kani::proof]
+    fn check_parse_numeric_12byte_panic_freedom() {
+        let bytes: [u8; 12] = kani::any();
+        let _ = parse_numeric(&bytes);
+    }
+
+    #[kani::proof]
+    fn check_parse_numeric_empty() {
+        let result = parse_numeric(&[]);
+        kani::assert(result.is_ok(), "empty input returns Ok");
+        kani::assert(result.unwrap() == 0, "empty input returns 0");
+    }
+
+    // =========================================================================
+    // encode_numeric: prove panic freedom and roundtrip
+    //
+    // encode_numeric selects between octal and base-256 encoding depending on
+    // the value and field size. We prove it never panics for any u64 value.
+    // =========================================================================
+
+    #[kani::proof]
+    fn check_encode_numeric_8byte_panic_freedom() {
+        let value: u64 = kani::any();
+        let mut field = [0u8; 8];
+        let _ = encode_numeric(&mut field, value);
+    }
+
+    #[kani::proof]
+    fn check_encode_numeric_12byte_panic_freedom() {
+        let value: u64 = kani::any();
+        let mut field = [0u8; 12];
+        let _ = encode_numeric(&mut field, value);
+    }
+
+    #[kani::proof]
+    fn check_encode_numeric_8byte_roundtrip() {
+        let value: u64 = kani::any();
+        let mut field = [0u8; 8];
+        let enc = encode_numeric(&mut field, value);
+        kani::assert(enc.is_ok(), "encode_numeric(8) should always succeed");
+        let decoded = parse_numeric(&field).unwrap();
+        kani::assert(decoded == value, "roundtrip must preserve value");
+    }
+
+    #[kani::proof]
+    fn check_encode_numeric_12byte_roundtrip() {
+        let value: u64 = kani::any();
+        let mut field = [0u8; 12];
+        let enc = encode_numeric(&mut field, value);
+        kani::assert(enc.is_ok(), "encode_numeric(12) should always succeed");
+        let decoded = parse_numeric(&field).unwrap();
+        kani::assert(decoded == value, "roundtrip must preserve value");
+    }
+
+    // =========================================================================
+    // EntryType: prove roundtrip for all 256 byte values
+    // =========================================================================
+
+    #[kani::proof]
+    fn check_entry_type_roundtrip() {
+        let byte: u8 = kani::any();
+        let entry_type = EntryType::from_byte(byte);
+        let back = entry_type.to_byte();
+        // '\0' canonicalizes to '0' for Regular, so the raw byte won't match
+        if byte != b'\0' {
+            kani::assert(back == byte, "non-null bytes must roundtrip exactly");
+        } else {
+            kani::assert(back == b'0', "null byte must canonicalize to '0'");
+        }
+    }
+
+    #[kani::proof]
+    fn check_entry_type_predicates_dont_panic() {
+        let byte: u8 = kani::any();
+        let ty = EntryType::from_byte(byte);
+        // None of these should panic
+        let _ = ty.is_file();
+        let _ = ty.is_dir();
+        let _ = ty.is_symlink();
+        let _ = ty.is_hard_link();
+        let _ = ty.is_character_special();
+        let _ = ty.is_block_special();
+        let _ = ty.is_fifo();
+        let _ = ty.is_contiguous();
+        let _ = ty.is_gnu_longname();
+        let _ = ty.is_gnu_longlink();
+        let _ = ty.is_gnu_sparse();
+        let _ = ty.is_pax_global_extensions();
+        let _ = ty.is_pax_local_extensions();
+    }
+}
