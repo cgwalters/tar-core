@@ -30,11 +30,11 @@
 //! let data = [0u8; 1024]; // Two zero blocks = end of archive
 //!
 //! match parser.parse(&data) {
-//!     Ok((consumed, ParseEvent::End)) => {
+//!     Ok(ParseEvent::End { consumed }) => {
 //!         println!("End of archive after {} bytes", consumed);
 //!     }
-//!     Ok((consumed, event)) => {
-//!         println!("Got event {:?}, consumed {} bytes", event, consumed);
+//!     Ok(event) => {
+//!         println!("Got event {:?}", event);
 //!     }
 //!     Err(e) => {
 //!         eprintln!("Parse error: {}", e);

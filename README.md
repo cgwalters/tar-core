@@ -72,13 +72,13 @@ let mut parser = Parser::new(Limits::default());
 
 // Feed data and get events - no I/O traits required
 match parser.parse(data) {
-    Ok((consumed, ParseEvent::Entry(entry))) => {
+    Ok(ParseEvent::Entry { consumed, entry }) => {
         println!("Found: {}", entry.path_lossy());
     }
-    Ok((_, ParseEvent::NeedData { min_bytes })) => {
+    Ok(ParseEvent::NeedData { min_bytes }) => {
         // Read more data into buffer
     }
-    Ok((consumed, ParseEvent::End)) => {
+    Ok(ParseEvent::End { consumed }) => {
         // Archive complete
     }
     Err(e) => eprintln!("Parse error: {}", e),

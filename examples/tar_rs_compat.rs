@@ -315,17 +315,6 @@ impl<R: Read> Archive<R> {
 // Entries iterator (tar-rs compatible)
 // ============================================================================
 
-/// Owned parse result to avoid borrow issues.
-///
-/// We extract what we need from the ParseEvent before releasing the borrow
-/// on the buffer, allowing us to mutate the reader afterwards.
-enum OwnedParseResult {
-    NeedData { min_bytes: usize },
-    Entry { consumed: usize, entry: Entry },
-    End { consumed: usize },
-    Error(io::Error),
-}
-
 /// Iterator over the entries in a tar archive.
 ///
 /// This wraps tar-core's event-based parser in a familiar iterator interface.
@@ -359,24 +348,19 @@ impl<R: Read> Iterator for Entries<'_, R> {
                 return None;
             }
 
-            // Parse the next event and extract owned data to release the borrow
-            let result = match self.archive.parser.parse(self.archive.buffer.data()) {
-                Ok((_, ParseEvent::NeedData { min_bytes })) => {
-                    OwnedParseResult::NeedData { min_bytes }
+            // Parse the next event; extract owned Entry to release the buffer borrow
+            let event = match self.archive.parser.parse(self.archive.buffer.data()) {
+                Ok(event) => event,
+                Err(e) => {
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )));
                 }
-                Ok((consumed, ParseEvent::Entry(parsed))) => OwnedParseResult::Entry {
-                    consumed,
-                    entry: Entry::from_parsed(&parsed),
-                },
-                Ok((consumed, ParseEvent::End)) => OwnedParseResult::End { consumed },
-                Err(e) => OwnedParseResult::Error(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    e.to_string(),
-                )),
             };
 
-            match result {
-                OwnedParseResult::NeedData { min_bytes } => {
+            match event {
+                ParseEvent::NeedData { min_bytes } => {
                     // Need more data
                     match self.archive.buffer.fill(min_bytes) {
                         Ok(true) => continue,
@@ -390,7 +374,12 @@ impl<R: Read> Iterator for Entries<'_, R> {
                     }
                 }
 
-                OwnedParseResult::Entry { consumed, entry } => {
+                ParseEvent::Entry {
+                    consumed,
+                    ref entry,
+                } => {
+                    let entry = Entry::from_parsed(entry);
+
                     // Consume the header bytes
                     self.archive.buffer.consume(consumed);
 
@@ -413,14 +402,10 @@ impl<R: Read> Iterator for Entries<'_, R> {
                     return Some(Ok(entry));
                 }
 
-                OwnedParseResult::End { consumed } => {
+                ParseEvent::End { consumed } => {
                     self.archive.buffer.consume(consumed);
                     self.archive.finished = true;
                     return None;
-                }
-
-                OwnedParseResult::Error(e) => {
-                    return Some(Err(e));
                 }
             }
         }

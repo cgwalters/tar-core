@@ -170,13 +170,6 @@ impl EntryInfo {
     }
 }
 
-/// Owned parse result to avoid borrow issues.
-enum OwnedParseResult {
-    NeedData { min_bytes: usize },
-    Entry { consumed: usize, info: EntryInfo },
-    End { consumed: usize },
-}
-
 /// Print entry information.
 fn print_entry(info: &EntryInfo) {
     let type_str = match info.entry_type {
@@ -215,24 +208,13 @@ fn process_archive(data: &[u8]) -> std::io::Result<()> {
         // Fill buffer - in async, this would `.await`
         buf.fill(HEADER_SIZE)?;
 
-        // Parse and extract owned data to release the borrow
-        let result = match parser.parse(buf.data()) {
-            Ok((_, ParseEvent::NeedData { min_bytes })) => OwnedParseResult::NeedData { min_bytes },
-            Ok((consumed, ParseEvent::Entry(entry))) => OwnedParseResult::Entry {
-                consumed,
-                info: EntryInfo::from_parsed(&entry),
-            },
-            Ok((consumed, ParseEvent::End)) => OwnedParseResult::End { consumed },
-            Err(e) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    e.to_string(),
-                ))
-            }
-        };
+        // Parse the next event
+        let event = parser
+            .parse(buf.data())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-        match result {
-            OwnedParseResult::NeedData { min_bytes } => {
+        match event {
+            ParseEvent::NeedData { min_bytes } => {
                 // Need more data - fill buffer and retry
                 // In async, this is where we'd yield if data isn't ready
                 if !buf.fill(min_bytes)? {
@@ -243,7 +225,11 @@ fn process_archive(data: &[u8]) -> std::io::Result<()> {
                 }
             }
 
-            OwnedParseResult::Entry { consumed, info } => {
+            ParseEvent::Entry {
+                consumed,
+                ref entry,
+            } => {
+                let info = EntryInfo::from_parsed(entry);
                 buf.consume(consumed);
                 count += 1;
                 print_entry(&info);
@@ -259,7 +245,7 @@ fn process_archive(data: &[u8]) -> std::io::Result<()> {
                 })?;
             }
 
-            OwnedParseResult::End { consumed } => {
+            ParseEvent::End { consumed } => {
                 buf.consume(consumed);
                 println!("\nArchive complete: {count} entries");
                 break;

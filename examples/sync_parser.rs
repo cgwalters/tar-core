@@ -165,13 +165,6 @@ impl EntryInfo {
     }
 }
 
-/// Parsed event result that owns its data.
-enum OwnedParseResult {
-    NeedData { min_bytes: usize },
-    Entry { consumed: usize, info: EntryInfo },
-    End { consumed: usize },
-}
-
 /// Process a tar archive, printing information about each entry.
 fn process_archive<R: Read>(reader: R) -> io::Result<()> {
     let mut buf = ReadBuffer::new(reader);
@@ -190,19 +183,13 @@ fn process_archive<R: Read>(reader: R) -> io::Result<()> {
             }
         }
 
-        // Parse and extract owned data to release the borrow
-        let result = match parser.parse(buf.data()) {
-            Ok((_, ParseEvent::NeedData { min_bytes })) => OwnedParseResult::NeedData { min_bytes },
-            Ok((consumed, ParseEvent::Entry(entry))) => OwnedParseResult::Entry {
-                consumed,
-                info: EntryInfo::from_parsed(&entry),
-            },
-            Ok((consumed, ParseEvent::End)) => OwnedParseResult::End { consumed },
-            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
-        };
+        // Parse the next event from the buffer
+        let event = parser
+            .parse(buf.data())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-        match result {
-            OwnedParseResult::NeedData { min_bytes } => {
+        match event {
+            ParseEvent::NeedData { min_bytes } => {
                 // Need more data - try to fill
                 if !buf.fill(min_bytes)? {
                     return Err(io::Error::new(
@@ -213,7 +200,11 @@ fn process_archive<R: Read>(reader: R) -> io::Result<()> {
                 // Loop around to parse again with more data
             }
 
-            OwnedParseResult::Entry { consumed, info } => {
+            ParseEvent::Entry {
+                consumed,
+                ref entry,
+            } => {
+                let info = EntryInfo::from_parsed(entry);
                 buf.consume(consumed);
                 entry_count += 1;
                 total_size += info.size;
@@ -288,7 +279,7 @@ fn process_archive<R: Read>(reader: R) -> io::Result<()> {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             }
 
-            OwnedParseResult::End { consumed } => {
+            ParseEvent::End { consumed } => {
                 buf.consume(consumed);
                 println!("\n--- Archive Summary ---");
                 println!("Entries: {}", entry_count);

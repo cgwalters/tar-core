@@ -249,7 +249,7 @@ impl<R: AsyncRead + Unpin> AsyncArchive<R> {
             let parse_result = self.parser.parse(self.buffer.data());
 
             match parse_result {
-                Ok((_, ParseEvent::NeedData { min_bytes })) => {
+                Ok(ParseEvent::NeedData { min_bytes }) => {
                     // Async: need more data
                     match self.buffer.fill(min_bytes).await {
                         Ok(true) => continue,
@@ -263,7 +263,10 @@ impl<R: AsyncRead + Unpin> AsyncArchive<R> {
                     }
                 }
 
-                Ok((consumed, ParseEvent::Entry(parsed))) => {
+                Ok(ParseEvent::Entry {
+                    consumed,
+                    entry: parsed,
+                }) => {
                     let entry = Entry::from_parsed(&parsed);
                     let size = entry.size;
 
@@ -282,7 +285,7 @@ impl<R: AsyncRead + Unpin> AsyncArchive<R> {
                     return Ok(Some(entry));
                 }
 
-                Ok((consumed, ParseEvent::End)) => {
+                Ok(ParseEvent::End { consumed }) => {
                     self.buffer.consume(consumed);
                     self.finished = true;
                     return Ok(None);
@@ -495,10 +498,7 @@ mod tests {
         // Check fifth entry (symlink)
         assert_eq!(entries[4].path_lossy(), "testdir/link");
         assert!(entries[4].is_symlink());
-        assert_eq!(
-            entries[4].link_name_bytes(),
-            Some(b"hello.txt".as_slice())
-        );
+        assert_eq!(entries[4].link_name_bytes(), Some(b"hello.txt".as_slice()));
     }
 
     #[tokio::test]
@@ -525,8 +525,7 @@ mod tests {
         let result = parser.parse(&data);
         assert!(result.is_ok());
 
-        let (consumed, event) = result.unwrap();
-        assert_eq!(consumed, 1024);
-        assert!(matches!(event, ParseEvent::End));
+        let event = result.unwrap();
+        assert!(matches!(event, ParseEvent::End { consumed: 1024 }));
     }
 }
