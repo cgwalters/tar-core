@@ -3277,7 +3277,7 @@ mod tests {
         mod builder_equivalence_tests {
             use super::*;
 
-            fn build_file_tar_core(params: &FileParams, fmt: TarFormat) -> [u8; 512] {
+            fn build_file_tar_core(params: &FileParams, fmt: TarFormat) -> Header {
                 let mut b = fmt.header_builder();
                 b.path(params.path.as_bytes())
                     .unwrap()
@@ -3314,7 +3314,7 @@ mod tests {
                 tar_rs_bytes(&h)
             }
 
-            fn build_symlink_tar_core(params: &SymlinkParams, fmt: TarFormat) -> [u8; 512] {
+            fn build_symlink_tar_core(params: &SymlinkParams, fmt: TarFormat) -> Header {
                 let mut b = fmt.header_builder();
                 b.path(params.path.as_bytes())
                     .unwrap()
@@ -3348,7 +3348,7 @@ mod tests {
                 tar_rs_bytes(&h)
             }
 
-            fn build_dir_tar_core(params: &DirParams, fmt: TarFormat) -> [u8; 512] {
+            fn build_dir_tar_core(params: &DirParams, fmt: TarFormat) -> Header {
                 let mut b = fmt.header_builder();
                 let path = if params.path.ends_with('/') {
                     params.path.clone()
@@ -3413,7 +3413,7 @@ mod tests {
                     fmt in tar_format_strategy(),
                 ) {
                     assert_headers_eq(
-                        &build_file_tar_core(&params, fmt),
+                        build_file_tar_core(&params, fmt).as_bytes(),
                         &build_file_tar_rs(&params, fmt),
                     );
                 }
@@ -3424,7 +3424,7 @@ mod tests {
                     fmt in tar_format_strategy(),
                 ) {
                     assert_headers_eq(
-                        &build_symlink_tar_core(&params, fmt),
+                        build_symlink_tar_core(&params, fmt).as_bytes(),
                         &build_symlink_tar_rs(&params, fmt),
                     );
                 }
@@ -3435,7 +3435,7 @@ mod tests {
                     fmt in tar_format_strategy(),
                 ) {
                     assert_headers_eq(
-                        &build_dir_tar_core(&params, fmt),
+                        build_dir_tar_core(&params, fmt).as_bytes(),
                         &build_dir_tar_rs(&params, fmt),
                     );
                 }
@@ -3720,7 +3720,7 @@ mod tests {
                 }
 
                 /// Extract all header blocks from a tar archive created by tar-rs.
-                fn extract_all_headers(tar_data: &[u8]) -> Vec<[u8; HEADER_SIZE]> {
+                fn extract_all_headers(tar_data: &[u8]) -> Vec<Header> {
                     let mut headers = Vec::new();
                     let mut offset = 0;
 
@@ -3734,10 +3734,10 @@ mod tests {
                             break;
                         }
 
-                        headers.push(block);
+                        let header = *Header::from_bytes(&block);
+                        headers.push(header);
 
                         // Parse header to get size and skip content
-                        let header = Header::from_bytes(&block);
                         if let Ok(size) = header.entry_size() {
                             let content_blocks = size.div_ceil(HEADER_SIZE as u64) as usize;
                             offset += HEADER_SIZE + content_blocks * HEADER_SIZE;
@@ -3768,9 +3768,7 @@ mod tests {
                 }
 
                 /// Build entry headers with a long path using tar-core.
-                fn build_long_path_with_tar_core(
-                    params: &LongPathFileParams,
-                ) -> Vec<[u8; HEADER_SIZE]> {
+                fn build_long_path_with_tar_core(params: &LongPathFileParams) -> Vec<Header> {
                     let mut builder = EntryBuilder::new_gnu();
                     builder
                         .path(params.path.as_bytes())
@@ -3807,9 +3805,7 @@ mod tests {
                 }
 
                 /// Build entry headers with a long symlink target using tar-core.
-                fn build_long_link_with_tar_core(
-                    params: &LongLinkParams,
-                ) -> Vec<[u8; HEADER_SIZE]> {
+                fn build_long_link_with_tar_core(params: &LongLinkParams) -> Vec<Header> {
                     let mut builder = EntryBuilder::new_gnu();
                     builder
                         .path(params.path.as_bytes())
@@ -3839,15 +3835,12 @@ mod tests {
                 /// Extension headers only need semantic equality (type, path,
                 /// size) since metadata fields like mode/uid/gid are set
                 /// differently by tar-rs vs tar-core (both are valid).
-                fn compare_extension_headers(
-                    our_blocks: &[[u8; HEADER_SIZE]],
-                    tar_headers: &[[u8; HEADER_SIZE]],
-                ) {
+                fn compare_extension_headers(our_blocks: &[Header], tar_headers: &[Header]) {
                     assert!(our_blocks.len() >= 2, "expected extension + main headers");
                     assert!(tar_headers.len() >= 2, "expected extension + main headers");
 
-                    let our_ext = Header::from_bytes(&our_blocks[0]);
-                    let tar_ext = Header::from_bytes(&tar_headers[0]);
+                    let our_ext = &our_blocks[0];
+                    let tar_ext = &tar_headers[0];
                     assert_eq!(our_ext.entry_type(), tar_ext.entry_type(), "extension type");
                     assert_eq!(our_ext.path_bytes(), tar_ext.path_bytes(), "extension path");
                     assert_eq!(
@@ -3859,8 +3852,8 @@ mod tests {
                     // Main header: compare key fields. The linkname field
                     // can differ because tar-rs normalizes paths while our
                     // builder writes raw bytes truncated to 100 bytes.
-                    let our_main = Header::from_bytes(our_blocks.last().unwrap());
-                    let tar_main = Header::from_bytes(tar_headers.last().unwrap());
+                    let our_main = our_blocks.last().unwrap();
+                    let tar_main = tar_headers.last().unwrap();
                     assert_eq!(our_main.entry_type(), tar_main.entry_type(), "main type");
                     assert_eq!(
                         our_main.mode().unwrap(),
@@ -4026,7 +4019,7 @@ mod tests {
                 }
 
                 /// Build entry with PAX xattrs using tar-core.
-                fn build_pax_with_tar_core(params: &PaxFileParams) -> Vec<[u8; HEADER_SIZE]> {
+                fn build_pax_with_tar_core(params: &PaxFileParams) -> Vec<Header> {
                     let mut builder = EntryBuilder::new_ustar();
                     builder
                         .path(params.path.as_bytes())
@@ -4066,11 +4059,11 @@ mod tests {
                     assert!(our_headers.len() >= 2, "should have PAX extension");
 
                     // First header should be XHeader
-                    let our_ext = Header::from_bytes(&our_headers[0]);
+                    let our_ext = &our_headers[0];
                     assert_eq!(our_ext.entry_type(), EntryType::XHeader);
 
                     // Last header should be Regular
-                    let our_main = Header::from_bytes(our_headers.last().unwrap());
+                    let our_main = our_headers.last().unwrap();
                     assert_eq!(our_main.entry_type(), EntryType::Regular);
                 }
 
@@ -4115,11 +4108,11 @@ mod tests {
                         prop_assert!(our_headers.len() >= 2, "should have PAX extension");
 
                         // First header should be XHeader
-                        let our_ext = Header::from_bytes(&our_headers[0]);
+                        let our_ext = &our_headers[0];
                         prop_assert_eq!(our_ext.entry_type(), EntryType::XHeader);
 
                         // Last header should be the main entry
-                        let our_main = Header::from_bytes(our_headers.last().unwrap());
+                        let our_main = our_headers.last().unwrap();
                         prop_assert_eq!(our_main.entry_type(), EntryType::Regular);
                         prop_assert_eq!(our_main.mode().unwrap(), params.mode);
                         prop_assert_eq!(our_main.uid().unwrap(), params.uid);

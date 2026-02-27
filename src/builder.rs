@@ -93,7 +93,7 @@ fn write_bytes<const N: usize>(field: &mut [u8; N], value: &[u8]) -> Result<()> 
 ///     .mtime(1234567890).unwrap()
 ///     .entry_type(EntryType::Regular);
 ///
-/// let header_bytes = builder.finish();
+/// let header = builder.finish();
 /// ```
 #[derive(Clone)]
 pub struct HeaderBuilder {
@@ -271,12 +271,12 @@ impl HeaderBuilder {
         &self.header
     }
 
-    /// Compute the checksum and return the final header bytes.
+    /// Compute the checksum and return the final header.
     ///
     /// This fills in the checksum field and returns the complete 512-byte
-    /// header block.
+    /// header.
     #[must_use]
-    pub fn finish(&mut self) -> [u8; HEADER_SIZE] {
+    pub fn finish(&mut self) -> Header {
         // Fill checksum field with spaces for calculation
         self.header.as_ustar_mut().checksum.fill(b' ');
 
@@ -288,7 +288,7 @@ impl HeaderBuilder {
         crate::encode_octal(&mut self.header.as_ustar_mut().checksum, checksum)
             .expect("checksum always fits in 8-byte octal field");
 
-        *self.header.as_bytes()
+        self.header
     }
 }
 
@@ -495,7 +495,7 @@ const GNU_LONGLINK_NAME: &[u8] = b"././@LongLink";
 ///
 /// # Sans-IO Design
 ///
-/// This builder does not perform any I/O. It produces `Vec<[u8; 512]>` blocks
+/// This builder does not perform any I/O. It produces `Vec<Header>` blocks
 /// or contiguous `Vec<u8>` that can be written to any output.
 ///
 /// # Extension Handling
@@ -847,7 +847,7 @@ impl EntryBuilder {
     /// - For GNU long paths: LongName header + data blocks + main header
     /// - For PAX: extended header + data blocks + main header
     #[must_use]
-    pub fn finish(&mut self) -> Vec<[u8; HEADER_SIZE]> {
+    pub fn finish(&mut self) -> Vec<Header> {
         let mut blocks = Vec::new();
 
         match self.mode {
@@ -883,19 +883,16 @@ impl EntryBuilder {
     /// This is a convenience method that flattens the block vector.
     #[must_use]
     pub fn finish_bytes(&mut self) -> Vec<u8> {
-        self.finish()
-            .into_iter()
-            .flat_map(|block| block.into_iter())
-            .collect()
+        let blocks = self.finish();
+        let mut out = Vec::with_capacity(blocks.len() * HEADER_SIZE);
+        for block in &blocks {
+            out.extend_from_slice(block.as_bytes());
+        }
+        out
     }
 
     /// Emit a GNU LongLink/LongName pseudo-entry.
-    fn emit_gnu_long_entry(
-        &self,
-        blocks: &mut Vec<[u8; HEADER_SIZE]>,
-        entry_type: EntryType,
-        data: &[u8],
-    ) {
+    fn emit_gnu_long_entry(&self, blocks: &mut Vec<Header>, entry_type: EntryType, data: &[u8]) {
         // The data is null-terminated in GNU format
         let data_with_null_len = data.len() + 1;
 
@@ -923,9 +920,9 @@ impl EntryBuilder {
         // Null terminator is already in place (vec initialized to 0)
 
         for chunk in data_buf.chunks_exact(HEADER_SIZE) {
-            let mut block = [0u8; HEADER_SIZE];
-            block.copy_from_slice(chunk);
-            blocks.push(block);
+            blocks.push(*Header::from_bytes(
+                chunk.try_into().expect("chunks_exact guarantees size"),
+            ));
         }
     }
 
@@ -945,7 +942,7 @@ impl EntryBuilder {
     }
 
     /// Emit a PAX extended header entry.
-    fn emit_pax_entry(&self, blocks: &mut Vec<[u8; HEADER_SIZE]>, pax_data: &[u8]) {
+    fn emit_pax_entry(&self, blocks: &mut Vec<Header>, pax_data: &[u8]) {
         // Build a name for the PAX header (following tar conventions)
         // Format: "PaxHeaders.0/<truncated_name>"
         let pax_name = self.build_pax_header_name();
@@ -971,9 +968,9 @@ impl EntryBuilder {
         data_buf[..pax_data.len()].copy_from_slice(pax_data);
 
         for chunk in data_buf.chunks_exact(HEADER_SIZE) {
-            let mut block = [0u8; HEADER_SIZE];
-            block.copy_from_slice(chunk);
-            blocks.push(block);
+            blocks.push(*Header::from_bytes(
+                chunk.try_into().expect("chunks_exact guarantees size"),
+            ));
         }
     }
 
@@ -1110,8 +1107,7 @@ mod tests {
             .groupname(b"group")
             .unwrap();
 
-        let header_bytes = builder.finish();
-        let header = Header::from_bytes(&header_bytes);
+        let header = builder.finish();
 
         assert_eq!(header.path_bytes(), b"test.txt");
         assert_eq!(header.mode().unwrap(), 0o644);
@@ -1147,8 +1143,7 @@ mod tests {
             .gid(0)
             .unwrap();
 
-        let header_bytes = builder.finish();
-        let header = Header::from_bytes(&header_bytes);
+        let header = builder.finish();
 
         assert_eq!(header.path_bytes(), b"link");
         assert_eq!(header.entry_type(), EntryType::Symlink);
@@ -1174,8 +1169,7 @@ mod tests {
             .gid(0)
             .unwrap();
 
-        let header_bytes = builder.finish();
-        let header = Header::from_bytes(&header_bytes);
+        let header = builder.finish();
 
         assert_eq!(header.entry_type(), EntryType::Directory);
         assert!(header.verify_checksum().is_ok());
@@ -1201,8 +1195,7 @@ mod tests {
             .gid(0)
             .unwrap();
 
-        let header_bytes = builder.finish();
-        let header = Header::from_bytes(&header_bytes);
+        let header = builder.finish();
 
         assert_eq!(header.entry_type(), EntryType::Char);
         assert_eq!(header.device_major().unwrap(), Some(1));
@@ -1319,10 +1312,8 @@ mod tests {
             .groupname(b"testgroup")
             .unwrap();
 
-        let header_bytes = builder.finish();
-
         // Parse it back
-        let parsed = Header::from_bytes(&header_bytes);
+        let parsed = builder.finish();
 
         // Verify all fields match
         assert_eq!(parsed.path_bytes(), b"roundtrip_test.txt");
@@ -1357,8 +1348,7 @@ mod tests {
             .unwrap()
             .entry_type(EntryType::Regular);
 
-        let header_bytes = builder.finish();
-        let parsed = Header::from_bytes(&header_bytes);
+        let parsed = builder.finish();
 
         assert!(parsed.is_gnu());
         assert_eq!(parsed.path_bytes(), b"gnu_test.dat");
@@ -1389,21 +1379,21 @@ mod tests {
     fn test_path_too_long() {
         let mut builder = HeaderBuilder::new_ustar();
         let long_path = [b'a'; 101];
-        assert!(builder.path(&long_path).is_err());
+        assert!(builder.path(long_path).is_err());
     }
 
     #[test]
     fn test_link_name_too_long() {
         let mut builder = HeaderBuilder::new_ustar();
         let long_link = [b'b'; 101];
-        assert!(builder.link_name(&long_link).is_err());
+        assert!(builder.link_name(long_link).is_err());
     }
 
     #[test]
     fn test_username_too_long() {
         let mut builder = HeaderBuilder::new_ustar();
         let long_name = [b'u'; 33];
-        assert!(builder.username(&long_name).is_err());
+        assert!(builder.username(long_name).is_err());
     }
 
     #[test]
@@ -1455,7 +1445,7 @@ mod tests {
         assert_eq!(blocks.len(), 1, "short path should produce single header");
 
         // Verify the header is valid
-        let header = Header::from_bytes(&blocks[0]);
+        let header = &blocks[0];
         assert_eq!(header.path_bytes(), b"hello.txt");
         assert_eq!(header.mode().unwrap(), 0o644);
         assert_eq!(header.entry_size().unwrap(), 1024);
@@ -1480,7 +1470,7 @@ mod tests {
         let blocks = builder.finish();
         assert_eq!(blocks.len(), 1);
 
-        let header = Header::from_bytes(&blocks[0]);
+        let header = &blocks[0];
         assert_eq!(header.path_bytes().len(), 100);
     }
 
@@ -1512,7 +1502,7 @@ mod tests {
         assert!(blocks.len() >= 3, "got {} blocks", blocks.len());
 
         // First block should be the GNU LongName header
-        let ext_header = Header::from_bytes(&blocks[0]);
+        let ext_header = &blocks[0];
         assert_eq!(ext_header.entry_type(), EntryType::GnuLongName);
         assert_eq!(ext_header.path_bytes(), b"././@LongLink");
         assert!(ext_header.verify_checksum().is_ok());
@@ -1521,12 +1511,12 @@ mod tests {
         assert_eq!(ext_header.entry_size().unwrap(), long_path.len() as u64 + 1);
 
         // Second block should contain the path data (null-terminated)
-        let data_block = &blocks[1];
+        let data_block = blocks[1].as_bytes();
         assert_eq!(&data_block[..long_path.len()], long_path.as_bytes());
         assert_eq!(data_block[long_path.len()], 0); // null terminator
 
         // Last block should be the main header
-        let main_header = Header::from_bytes(blocks.last().unwrap());
+        let main_header = blocks.last().unwrap();
         assert_eq!(main_header.entry_type(), EntryType::Regular);
         assert!(main_header.verify_checksum().is_ok());
     }
@@ -1559,12 +1549,12 @@ mod tests {
         assert!(blocks.len() >= 3);
 
         // First block should be the GNU LongLink header
-        let ext_header = Header::from_bytes(&blocks[0]);
+        let ext_header = &blocks[0];
         assert_eq!(ext_header.entry_type(), EntryType::GnuLongLink);
         assert_eq!(ext_header.path_bytes(), b"././@LongLink");
 
         // Last block should be the symlink header
-        let main_header = Header::from_bytes(blocks.last().unwrap());
+        let main_header = blocks.last().unwrap();
         assert_eq!(main_header.entry_type(), EntryType::Symlink);
     }
 
@@ -1599,19 +1589,18 @@ mod tests {
         assert!(blocks.len() >= 5, "got {} blocks", blocks.len());
 
         // First should be LongLink (for link target)
-        let first = Header::from_bytes(&blocks[0]);
+        let first = &blocks[0];
         assert_eq!(first.entry_type(), EntryType::GnuLongLink);
 
         // After LongLink data, should be LongName
         // Find the LongName header
-        let longname_idx = blocks.iter().position(|b| {
-            let h = Header::from_bytes(b);
-            h.entry_type() == EntryType::GnuLongName
-        });
+        let longname_idx = blocks
+            .iter()
+            .position(|b| b.entry_type() == EntryType::GnuLongName);
         assert!(longname_idx.is_some(), "should have LongName header");
 
         // Last should be main header
-        let main = Header::from_bytes(blocks.last().unwrap());
+        let main = blocks.last().unwrap();
         assert_eq!(main.entry_type(), EntryType::Symlink);
     }
 
@@ -1643,19 +1632,19 @@ mod tests {
         assert!(blocks.len() >= 3);
 
         // First block should be the PAX extended header
-        let pax_header = Header::from_bytes(&blocks[0]);
+        let pax_header = &blocks[0];
         assert_eq!(pax_header.entry_type(), EntryType::XHeader);
         assert!(pax_header.verify_checksum().is_ok());
 
         // Second block should contain PAX records
-        let pax_data = &blocks[1];
+        let pax_data = blocks[1].as_bytes();
         // The PAX data should contain "path=<long_path>"
         let pax_str = String::from_utf8_lossy(pax_data);
         assert!(pax_str.contains("path="));
         assert!(pax_str.contains(&long_path));
 
         // Last block should be the main header
-        let main_header = Header::from_bytes(blocks.last().unwrap());
+        let main_header = blocks.last().unwrap();
         assert_eq!(main_header.entry_type(), EntryType::Regular);
         assert!(main_header.is_ustar());
     }
@@ -1678,11 +1667,11 @@ mod tests {
         let blocks = builder.finish();
 
         // First block should be PAX header
-        let pax_header = Header::from_bytes(&blocks[0]);
+        let pax_header = &blocks[0];
         assert_eq!(pax_header.entry_type(), EntryType::XHeader);
 
         // PAX data should contain linkpath
-        let pax_data = &blocks[1];
+        let pax_data = blocks[1].as_bytes();
         let pax_str = String::from_utf8_lossy(pax_data);
         assert!(pax_str.contains("linkpath="));
     }
@@ -1704,10 +1693,10 @@ mod tests {
         let blocks = builder.finish();
         assert!(blocks.len() >= 3);
 
-        let pax_header = Header::from_bytes(&blocks[0]);
+        let pax_header = &blocks[0];
         assert_eq!(pax_header.entry_type(), EntryType::XHeader);
 
-        let pax_data = &blocks[1];
+        let pax_data = blocks[1].as_bytes();
         let pax_str = String::from_utf8_lossy(pax_data);
         assert!(pax_str.contains("SCHILY.xattr.user.test=value"));
     }
@@ -1734,7 +1723,7 @@ mod tests {
 
         let blocks = builder.finish();
         // Should use PAX, not GNU
-        let first = Header::from_bytes(&blocks[0]);
+        let first = &blocks[0];
         assert_eq!(first.entry_type(), EntryType::XHeader);
     }
 
@@ -1774,7 +1763,7 @@ mod tests {
         let blocks = builder.finish();
         assert_eq!(blocks.len(), 1);
 
-        let header = Header::from_bytes(&blocks[0]);
+        let header = &blocks[0];
         assert_eq!(header.entry_type(), EntryType::Directory);
         assert!(header.verify_checksum().is_ok());
     }
@@ -1793,7 +1782,7 @@ mod tests {
             .entry_type(EntryType::Char);
 
         let blocks = builder.finish();
-        let header = Header::from_bytes(&blocks[0]);
+        let header = &blocks[0];
         assert_eq!(header.entry_type(), EntryType::Char);
         assert_eq!(header.device_major().unwrap(), Some(1));
         assert_eq!(header.device_minor().unwrap(), Some(3));
@@ -1852,7 +1841,7 @@ mod tests {
         // LongName header + 2 data blocks (600+1 = 601 bytes, needs 2 blocks) + main header = 4
         assert!(blocks.len() >= 4, "got {} blocks", blocks.len());
 
-        let ext_header = Header::from_bytes(&blocks[0]);
+        let ext_header = &blocks[0];
         assert_eq!(ext_header.entry_type(), EntryType::GnuLongName);
         // Size should be 601 (path + null terminator)
         assert_eq!(ext_header.entry_size().unwrap(), 601);
@@ -1874,7 +1863,7 @@ mod tests {
             .entry_type(EntryType::Regular);
 
         let blocks = builder.finish();
-        let header = Header::from_bytes(&blocks[0]);
+        let header = &blocks[0];
         assert_eq!(header.username().unwrap(), b"testuser");
         assert_eq!(header.groupname().unwrap(), b"testgroup");
     }
@@ -1918,14 +1907,14 @@ mod tests {
         assert!(blocks.len() >= 3, "expected PAX extension blocks");
 
         // First block should be the PAX XHeader.
-        let pax_header = Header::from_bytes(&blocks[0]);
+        let pax_header = &blocks[0];
         assert!(pax_header.entry_type().is_pax_local_extensions());
 
         // Parse the PAX data to verify the numeric values are present.
         let pax_data_blocks = blocks.len() - 2; // minus PAX header and main header
         let pax_data: Vec<u8> = blocks[1..1 + pax_data_blocks]
             .iter()
-            .flat_map(|b| b.iter().copied())
+            .flat_map(|b| b.as_bytes().iter().copied())
             .collect();
         let exts = PaxExtensions::new(&pax_data);
         assert_eq!(exts.get_u64("uid"), Some(large_uid));
@@ -1934,7 +1923,7 @@ mod tests {
         assert_eq!(exts.get_u64("mtime"), Some(large_size));
 
         // Main header should have 0 in the overflowed fields.
-        let main_header = Header::from_bytes(blocks.last().unwrap());
+        let main_header = blocks.last().unwrap();
         assert_eq!(main_header.uid().unwrap(), 0);
         assert_eq!(main_header.entry_size().unwrap(), 0);
     }
@@ -1959,7 +1948,7 @@ mod tests {
         let blocks = builder.finish();
         // GNU with no long path: just 1 block, no extensions needed.
         assert_eq!(blocks.len(), 1);
-        let header = Header::from_bytes(&blocks[0]);
+        let header = &blocks[0];
         assert_eq!(header.uid().unwrap(), large_uid);
         assert_eq!(header.gid().unwrap(), large_uid);
     }
