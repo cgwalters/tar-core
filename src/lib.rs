@@ -636,14 +636,6 @@ impl EntryType {
         }
     }
 
-    /// Returns the raw byte representation of this entry type.
-    ///
-    /// This is an alias for [`to_byte`](Self::to_byte) for tar-rs compatibility.
-    #[must_use]
-    pub fn as_byte(self) -> u8 {
-        self.to_byte()
-    }
-
     // =========================================================================
     // Predicates
     // =========================================================================
@@ -814,14 +806,6 @@ impl Header {
 
     /// Get a mutable reference to the underlying bytes.
     pub fn as_mut_bytes(&mut self) -> &mut [u8; HEADER_SIZE] {
-        &mut self.bytes
-    }
-
-    /// Get a mutable reference to the underlying bytes.
-    ///
-    /// This is an alias for [`as_mut_bytes`](Self::as_mut_bytes) for
-    /// compatibility with tar-rs naming conventions.
-    pub fn as_bytes_mut(&mut self) -> &mut [u8; HEADER_SIZE] {
         &mut self.bytes
     }
 
@@ -1282,13 +1266,13 @@ pub fn parse_octal(bytes: &[u8]) -> Result<u64> {
     let trimmed = bytes
         .iter()
         .position(|&b| b != b' ')
-        .and_then(|start| {
+        .map(|start| {
             let rest = &bytes[start..];
             let end = rest
                 .iter()
                 .position(|&b| b == b' ' || b == b'\0')
                 .unwrap_or(rest.len());
-            Some(&rest[..end])
+            &rest[..end]
         })
         .unwrap_or(&[]);
 
@@ -2339,15 +2323,6 @@ mod tests {
         assert!(gnu.is_extended());
         gnu.set_is_extended(false);
         assert!(!gnu.is_extended());
-    }
-
-    #[test]
-    fn test_as_bytes_mut_alias() {
-        let mut header = Header::new_ustar();
-        // Both should return the same thing
-        let ptr1 = header.as_mut_bytes().as_ptr();
-        let ptr2 = header.as_bytes_mut().as_ptr();
-        assert_eq!(ptr1, ptr2);
     }
 
     /// Cross-checking tests against the `tar` crate using proptest.

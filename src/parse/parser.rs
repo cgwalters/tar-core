@@ -6,7 +6,7 @@ use crate::stream::{Limits, StreamError};
 use crate::{EntryType, Header, PaxExtensions, HEADER_SIZE, PAX_SCHILY_XATTR};
 
 /// Result type for sans-IO parsing operations.
-pub type Result<T> = std::result::Result<T, StreamError>;
+type Result<T> = std::result::Result<T, StreamError>;
 
 /// Events emitted by the sans-IO parser.
 #[derive(Debug)]
