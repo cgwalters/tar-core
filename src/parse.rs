@@ -51,7 +51,8 @@ use std::str::Utf8Error;
 use thiserror::Error;
 
 use crate::{
-    EntryType, Header, HeaderError, PaxError, PaxExtensions, HEADER_SIZE, PAX_SCHILY_XATTR,
+    EntryType, Header, HeaderError, PaxError, PaxExtensions, HEADER_SIZE, PAX_GID, PAX_GNAME,
+    PAX_LINKPATH, PAX_MTIME, PAX_PATH, PAX_SCHILY_XATTR, PAX_SIZE, PAX_UID, PAX_UNAME,
 };
 
 // ============================================================================
@@ -929,7 +930,7 @@ impl Parser {
                 let value = ext.value_bytes();
 
                 match key {
-                    "path" => {
+                    PAX_PATH => {
                         if value.len() > self.limits.max_path_len {
                             return Err(ParseError::PathTooLong {
                                 len: value.len(),
@@ -938,7 +939,7 @@ impl Parser {
                         }
                         path = Cow::Owned(value.to_vec());
                     }
-                    "linkpath" => {
+                    PAX_LINKPATH => {
                         if value.len() > self.limits.max_path_len {
                             return Err(ParseError::PathTooLong {
                                 len: value.len(),
@@ -947,22 +948,22 @@ impl Parser {
                         }
                         link_target = Some(Cow::Owned(value.to_vec()));
                     }
-                    "size" => {
-                        if let Some(v) = parse_pax_u64(&ext, "size")? {
+                    PAX_SIZE => {
+                        if let Some(v) = parse_pax_u64(&ext, PAX_SIZE)? {
                             entry_size = v;
                         }
                     }
-                    "uid" => {
-                        if let Some(v) = parse_pax_u64(&ext, "uid")? {
+                    PAX_UID => {
+                        if let Some(v) = parse_pax_u64(&ext, PAX_UID)? {
                             uid = v;
                         }
                     }
-                    "gid" => {
-                        if let Some(v) = parse_pax_u64(&ext, "gid")? {
+                    PAX_GID => {
+                        if let Some(v) = parse_pax_u64(&ext, PAX_GID)? {
                             gid = v;
                         }
                     }
-                    "mtime" => {
+                    PAX_MTIME => {
                         // mtime may have fractional seconds (e.g. "1234567890.5");
                         // parse only the integer part.
                         let s = match ext.value() {
@@ -970,7 +971,7 @@ impl Parser {
                             Err(_) if !strict => continue,
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxValue {
-                                    key: "mtime",
+                                    key: PAX_MTIME,
                                     value: String::from_utf8_lossy(value).into(),
                                 })
                             }
@@ -981,16 +982,16 @@ impl Parser {
                             Err(_) if !strict => {}
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxValue {
-                                    key: "mtime",
+                                    key: PAX_MTIME,
                                     value: s.into(),
                                 })
                             }
                         }
                     }
-                    "uname" => {
+                    PAX_UNAME => {
                         uname = Some(Cow::Owned(value.to_vec()));
                     }
-                    "gname" => {
+                    PAX_GNAME => {
                         gname = Some(Cow::Owned(value.to_vec()));
                     }
                     _ => {
@@ -1050,6 +1051,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{USTAR_MAGIC, USTAR_VERSION};
 
     #[test]
     fn test_default_limits() {
@@ -1131,9 +1133,9 @@ mod tests {
         // typeflag: '0' (regular file)
         data[156] = b'0';
         // magic: "ustar\0"
-        data[257..263].copy_from_slice(b"ustar\0");
+        data[257..263].copy_from_slice(USTAR_MAGIC);
         // version: "00"
-        data[263..265].copy_from_slice(b"00");
+        data[263..265].copy_from_slice(USTAR_VERSION);
 
         // Compute and set checksum
         let header = Header::from_bytes(&data[..512]).unwrap();
@@ -1178,8 +1180,8 @@ mod tests {
         data[124..135].copy_from_slice(b"00000000005"); // size = 5
         data[136..147].copy_from_slice(b"00000000000");
         data[156] = b'0';
-        data[257..263].copy_from_slice(b"ustar\0");
-        data[263..265].copy_from_slice(b"00");
+        data[257..263].copy_from_slice(USTAR_MAGIC);
+        data[263..265].copy_from_slice(USTAR_VERSION);
 
         // Checksum
         let header = Header::from_bytes(&data[..512]).unwrap();
@@ -1248,10 +1250,10 @@ mod tests {
         header[156] = typeflag;
 
         // magic (257..263): "ustar\0"
-        header[257..263].copy_from_slice(b"ustar\0");
+        header[257..263].copy_from_slice(USTAR_MAGIC);
 
         // version (263..265): "00"
-        header[263..265].copy_from_slice(b"00");
+        header[263..265].copy_from_slice(USTAR_VERSION);
 
         // Compute and set checksum
         let hdr = Header::from_bytes(&header).unwrap();
@@ -2066,7 +2068,7 @@ mod tests {
         let err = parser.parse(&archive).unwrap_err();
         assert!(matches!(
             err,
-            ParseError::InvalidPaxValue { key: "mtime", .. }
+            ParseError::InvalidPaxValue { key: PAX_MTIME, .. }
         ));
     }
 

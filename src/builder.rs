@@ -17,7 +17,10 @@
 //!     .finish();
 //! ```
 
-use crate::{EntryType, Header, HeaderError, Result, UstarHeader, HEADER_SIZE};
+use crate::{
+    EntryType, Header, HeaderError, Result, UstarHeader, HEADER_SIZE, PAX_ATIME, PAX_CTIME,
+    PAX_GID, PAX_GNAME, PAX_LINKPATH, PAX_MTIME, PAX_PATH, PAX_SIZE, PAX_UID, PAX_UNAME,
+};
 
 /// Stack-allocated decimal formatter for u64.
 ///
@@ -368,12 +371,12 @@ impl PaxBuilder {
 
     /// Add a path record.
     pub fn path(&mut self, path: &[u8]) -> &mut Self {
-        self.add("path", path)
+        self.add(PAX_PATH, path)
     }
 
     /// Add a linkpath record.
     pub fn linkpath(&mut self, path: &[u8]) -> &mut Self {
-        self.add("linkpath", path)
+        self.add(PAX_LINKPATH, path)
     }
 
     /// Add a record with a u64 value formatted as decimal.
@@ -384,42 +387,42 @@ impl PaxBuilder {
 
     /// Add a size record.
     pub fn size(&mut self, size: u64) -> &mut Self {
-        self.add_u64("size", size)
+        self.add_u64(PAX_SIZE, size)
     }
 
     /// Add a uid record.
     pub fn uid(&mut self, uid: u64) -> &mut Self {
-        self.add_u64("uid", uid)
+        self.add_u64(PAX_UID, uid)
     }
 
     /// Add a gid record.
     pub fn gid(&mut self, gid: u64) -> &mut Self {
-        self.add_u64("gid", gid)
+        self.add_u64(PAX_GID, gid)
     }
 
     /// Add a uname (username) record.
     pub fn uname(&mut self, name: &[u8]) -> &mut Self {
-        self.add("uname", name)
+        self.add(PAX_UNAME, name)
     }
 
     /// Add a gname (group name) record.
     pub fn gname(&mut self, name: &[u8]) -> &mut Self {
-        self.add("gname", name)
+        self.add(PAX_GNAME, name)
     }
 
     /// Add an mtime record.
     pub fn mtime(&mut self, mtime: u64) -> &mut Self {
-        self.add_u64("mtime", mtime)
+        self.add_u64(PAX_MTIME, mtime)
     }
 
     /// Add an atime record.
     pub fn atime(&mut self, atime: u64) -> &mut Self {
-        self.add_u64("atime", atime)
+        self.add_u64(PAX_ATIME, atime)
     }
 
     /// Add a ctime record.
     pub fn ctime(&mut self, ctime: u64) -> &mut Self {
-        self.add_u64("ctime", ctime)
+        self.add_u64(PAX_CTIME, ctime)
     }
 
     /// Get the current data (for inspection).

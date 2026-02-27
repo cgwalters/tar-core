@@ -36,7 +36,7 @@ impl PendingMetadata {
 /// A fully-resolved tar entry with all extensions applied.
 #[derive(Debug)]
 pub struct ParsedEntry<'a> {
-    pub header_bytes: &'a [u8; 512],
+    pub header_bytes: &'a [u8; HEADER_SIZE],
     pub entry_type: EntryType,
     pub path: Cow<'a, [u8]>,
     pub link_target: Option<Cow<'a, [u8]>>,
@@ -82,7 +82,7 @@ impl<'a> ParsedEntry<'a> {
 
     #[must_use]
     pub fn padded_size(&self) -> u64 {
-        self.size.next_multiple_of(512)
+        self.size.next_multiple_of(HEADER_SIZE as u64)
     }
 }
 
@@ -161,7 +161,7 @@ impl<R: Read> TarStreamParser<R> {
             let entry_type = header.entry_type();
             let size = header.entry_size()?;
             let padded_size = size
-                .checked_next_multiple_of(512)
+                .checked_next_multiple_of(HEADER_SIZE as u64)
                 .ok_or(ParseError::InvalidSize(size))?;
 
             match entry_type {
@@ -200,14 +200,14 @@ impl<R: Read> TarStreamParser<R> {
 
     pub fn skip_content(&mut self, size: u64) -> Result<()> {
         let padded = size
-            .checked_next_multiple_of(512)
+            .checked_next_multiple_of(HEADER_SIZE as u64)
             .ok_or(ParseError::InvalidSize(size))?;
         self.skip_bytes(padded)
     }
 
     pub fn skip_padding(&mut self, content_size: u64) -> Result<()> {
         let padded = content_size
-            .checked_next_multiple_of(512)
+            .checked_next_multiple_of(HEADER_SIZE as u64)
             .ok_or(ParseError::InvalidSize(content_size))?;
         let padding = padded - content_size;
         if padding > 0 {
