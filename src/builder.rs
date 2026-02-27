@@ -19,6 +19,36 @@
 
 use crate::{EntryType, Header, HeaderError, Result, UstarHeader, HEADER_SIZE};
 
+/// Stack-allocated decimal formatter for u64.
+///
+/// Formats a u64 into a fixed-size byte buffer without allocating.
+/// Max u64 is 20 digits ("18446744073709551615").
+struct DecU64 {
+    buf: [u8; 20],
+    start: u8,
+}
+
+impl DecU64 {
+    fn new(mut value: u64) -> Self {
+        let mut buf = [0u8; 20];
+        if value == 0 {
+            buf[19] = b'0';
+            return Self { buf, start: 19 };
+        }
+        let mut pos = 20u8;
+        while value > 0 {
+            pos -= 1;
+            buf[pos as usize] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        Self { buf, start: pos }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[self.start as usize..]
+    }
+}
+
 /// Write a byte slice into a fixed-size header field.
 ///
 /// The const generic `N` carries the field size from the zerocopy header
@@ -248,12 +278,7 @@ impl HeaderBuilder {
         let checksum: u64 = self.header.as_bytes().iter().map(|&b| u64::from(b)).sum();
 
         // Write checksum: 7 octal digits with leading zeros + null terminator.
-        // Matches tar-rs bit-for-bit.
-        let checksum_str = format!("{checksum:07o}\0");
-        self.header
-            .as_ustar_mut()
-            .checksum
-            .copy_from_slice(checksum_str.as_bytes());
+        let _ = crate::encode_octal(&mut self.header.as_ustar_mut().checksum, checksum);
 
         *self.header.as_bytes()
     }
@@ -328,10 +353,13 @@ impl PaxBuilder {
             len_len += 1;
             max_len *= 10;
         }
-        let len = rest_len + len_len;
+        let total_len = rest_len + len_len;
 
-        use std::io::Write;
-        write!(&mut self.data, "{} {}=", len, key).unwrap();
+        let len_dec = DecU64::new(total_len as u64);
+        self.data.extend_from_slice(len_dec.as_bytes());
+        self.data.push(b' ');
+        self.data.extend_from_slice(key.as_bytes());
+        self.data.push(b'=');
         self.data.extend_from_slice(value);
         self.data.push(b'\n');
 
@@ -348,19 +376,25 @@ impl PaxBuilder {
         self.add("linkpath", path)
     }
 
+    /// Add a record with a u64 value formatted as decimal.
+    pub fn add_u64(&mut self, key: &str, value: u64) -> &mut Self {
+        let buf = DecU64::new(value);
+        self.add(key, buf.as_bytes())
+    }
+
     /// Add a size record.
     pub fn size(&mut self, size: u64) -> &mut Self {
-        self.add("size", size.to_string().as_bytes())
+        self.add_u64("size", size)
     }
 
     /// Add a uid record.
     pub fn uid(&mut self, uid: u64) -> &mut Self {
-        self.add("uid", uid.to_string().as_bytes())
+        self.add_u64("uid", uid)
     }
 
     /// Add a gid record.
     pub fn gid(&mut self, gid: u64) -> &mut Self {
-        self.add("gid", gid.to_string().as_bytes())
+        self.add_u64("gid", gid)
     }
 
     /// Add a uname (username) record.
@@ -375,17 +409,17 @@ impl PaxBuilder {
 
     /// Add an mtime record.
     pub fn mtime(&mut self, mtime: u64) -> &mut Self {
-        self.add("mtime", mtime.to_string().as_bytes())
+        self.add_u64("mtime", mtime)
     }
 
     /// Add an atime record.
     pub fn atime(&mut self, atime: u64) -> &mut Self {
-        self.add("atime", atime.to_string().as_bytes())
+        self.add_u64("atime", atime)
     }
 
     /// Add a ctime record.
     pub fn ctime(&mut self, ctime: u64) -> &mut Self {
-        self.add("ctime", ctime.to_string().as_bytes())
+        self.add_u64("ctime", ctime)
     }
 
     /// Get the current data (for inspection).

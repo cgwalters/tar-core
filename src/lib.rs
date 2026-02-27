@@ -1173,9 +1173,8 @@ impl Header {
         // Compute unsigned sum of all bytes
         let checksum: u64 = self.bytes.iter().map(|&b| u64::from(b)).sum();
 
-        // Write checksum as 7 octal digits + null (matches tar-rs format)
-        let checksum_str = format!("{checksum:07o}\0");
-        self.bytes[148..156].copy_from_slice(checksum_str.as_bytes());
+        // Write checksum as 7 octal digits + null
+        let _ = encode_octal(&mut self.bytes[148..156], checksum);
     }
 
     /// Set the file path (name field, bytes 0-100).
