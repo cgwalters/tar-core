@@ -84,8 +84,8 @@ pub mod parse;
 pub mod stream;
 
 pub use builder::{
-    blocks_for_size, pad_to_block_boundary, EntryBuilder, ExtensionMode, HeaderBuilder, PaxBuilder,
-    LINKNAME_MAX_LEN, NAME_MAX_LEN,
+    blocks_for_size, EntryBuilder, ExtensionMode, HeaderBuilder, PaxBuilder, LINKNAME_MAX_LEN,
+    NAME_MAX_LEN,
 };
 
 use std::fmt;

@@ -930,17 +930,6 @@ pub const fn blocks_for_size(size: u64) -> u64 {
     size.div_ceil(HEADER_SIZE as u64)
 }
 
-/// Pad data to a 512-byte boundary.
-///
-/// Returns the data with zero-padding appended to reach a multiple of 512 bytes.
-#[must_use]
-pub fn pad_to_block_boundary(data: &[u8]) -> Vec<u8> {
-    let padded_len = data.len().div_ceil(HEADER_SIZE) * HEADER_SIZE;
-    let mut padded = vec![0u8; padded_len];
-    padded[..data.len()].copy_from_slice(data);
-    padded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1741,33 +1730,6 @@ mod tests {
         assert_eq!(blocks_for_size(513), 2);
         assert_eq!(blocks_for_size(1024), 2);
         assert_eq!(blocks_for_size(1025), 3);
-    }
-
-    #[test]
-    fn test_pad_to_block_boundary() {
-        // Empty
-        let padded = pad_to_block_boundary(&[]);
-        assert!(padded.is_empty());
-
-        // Less than 512
-        let data = [1u8; 100];
-        let padded = pad_to_block_boundary(&data);
-        assert_eq!(padded.len(), 512);
-        assert_eq!(&padded[..100], &data);
-        assert!(padded[100..].iter().all(|&b| b == 0));
-
-        // Exactly 512
-        let data = [2u8; 512];
-        let padded = pad_to_block_boundary(&data);
-        assert_eq!(padded.len(), 512);
-        assert_eq!(&padded[..], &data);
-
-        // More than 512
-        let data = [3u8; 600];
-        let padded = pad_to_block_boundary(&data);
-        assert_eq!(padded.len(), 1024);
-        assert_eq!(&padded[..600], &data);
-        assert!(padded[600..].iter().all(|&b| b == 0));
     }
 
     #[test]
