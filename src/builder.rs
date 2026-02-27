@@ -131,8 +131,8 @@ impl HeaderBuilder {
     /// # Errors
     ///
     /// Returns an error if the path is longer than 100 bytes.
-    pub fn path(&mut self, path: &[u8]) -> Result<&mut Self> {
-        write_bytes(&mut self.fields_mut().name, path)?;
+    pub fn path(&mut self, path: impl AsRef<[u8]>) -> Result<&mut Self> {
+        write_bytes(&mut self.fields_mut().name, path.as_ref())?;
         Ok(self)
     }
 
@@ -214,8 +214,8 @@ impl HeaderBuilder {
     /// # Errors
     ///
     /// Returns an error if the link name is longer than 100 bytes.
-    pub fn link_name(&mut self, link: &[u8]) -> Result<&mut Self> {
-        write_bytes(&mut self.fields_mut().linkname, link)?;
+    pub fn link_name(&mut self, link: impl AsRef<[u8]>) -> Result<&mut Self> {
+        write_bytes(&mut self.fields_mut().linkname, link.as_ref())?;
         Ok(self)
     }
 
@@ -224,8 +224,8 @@ impl HeaderBuilder {
     /// # Errors
     ///
     /// Returns an error if the username is longer than 32 bytes.
-    pub fn username(&mut self, name: &[u8]) -> Result<&mut Self> {
-        write_bytes(&mut self.fields_mut().uname, name)?;
+    pub fn username(&mut self, name: impl AsRef<[u8]>) -> Result<&mut Self> {
+        write_bytes(&mut self.fields_mut().uname, name.as_ref())?;
         Ok(self)
     }
 
@@ -234,8 +234,8 @@ impl HeaderBuilder {
     /// # Errors
     ///
     /// Returns an error if the group name is longer than 32 bytes.
-    pub fn groupname(&mut self, name: &[u8]) -> Result<&mut Self> {
-        write_bytes(&mut self.fields_mut().gname, name)?;
+    pub fn groupname(&mut self, name: impl AsRef<[u8]>) -> Result<&mut Self> {
+        write_bytes(&mut self.fields_mut().gname, name.as_ref())?;
         Ok(self)
     }
 
@@ -257,8 +257,8 @@ impl HeaderBuilder {
     /// # Errors
     ///
     /// Returns an error if the prefix is longer than 155 bytes.
-    pub fn prefix(&mut self, prefix: &[u8]) -> Result<&mut Self> {
-        write_bytes(&mut self.fields_mut().prefix, prefix)?;
+    pub fn prefix(&mut self, prefix: impl AsRef<[u8]>) -> Result<&mut Self> {
+        write_bytes(&mut self.fields_mut().prefix, prefix.as_ref())?;
         Ok(self)
     }
 
@@ -347,7 +347,8 @@ impl PaxBuilder {
     /// The length prefix includes itself, which requires computing how many
     /// decimal digits the total length will occupy. This uses the same
     /// algorithm as tar-rs's `append_pax_extensions`.
-    pub fn add(&mut self, key: &str, value: &[u8]) -> &mut Self {
+    pub fn add(&mut self, key: &str, value: impl AsRef<[u8]>) -> &mut Self {
+        let value = value.as_ref();
         // Format: "<len> <key>=<value>\n"
         // rest_len covers: " " + key + "=" + value + "\n"
         let rest_len = 3 + key.len() + value.len();
@@ -375,12 +376,12 @@ impl PaxBuilder {
     }
 
     /// Add a path record.
-    pub fn path(&mut self, path: &[u8]) -> &mut Self {
+    pub fn path(&mut self, path: impl AsRef<[u8]>) -> &mut Self {
         self.add(PAX_PATH, path)
     }
 
     /// Add a linkpath record.
-    pub fn linkpath(&mut self, path: &[u8]) -> &mut Self {
+    pub fn linkpath(&mut self, path: impl AsRef<[u8]>) -> &mut Self {
         self.add(PAX_LINKPATH, path)
     }
 
@@ -406,12 +407,12 @@ impl PaxBuilder {
     }
 
     /// Add a uname (username) record.
-    pub fn uname(&mut self, name: &[u8]) -> &mut Self {
+    pub fn uname(&mut self, name: impl AsRef<[u8]>) -> &mut Self {
         self.add(PAX_UNAME, name)
     }
 
     /// Add a gname (group name) record.
-    pub fn gname(&mut self, name: &[u8]) -> &mut Self {
+    pub fn gname(&mut self, name: impl AsRef<[u8]>) -> &mut Self {
         self.add(PAX_GNAME, name)
     }
 
@@ -602,7 +603,8 @@ impl EntryBuilder {
     /// If the path exceeds 100 bytes, it will be stored using the configured
     /// extension mechanism (GNU or PAX). The main header's name field will
     /// contain a truncated version (first 100 bytes, matching GNU tar).
-    pub fn path(&mut self, path: &[u8]) -> &mut Self {
+    pub fn path(&mut self, path: impl AsRef<[u8]>) -> &mut Self {
+        let path = path.as_ref();
         if path.len() > NAME_MAX_LEN {
             self.long_path = Some(path.to_vec());
             // Store the first 100 bytes in the main header for compatibility
@@ -624,7 +626,8 @@ impl EntryBuilder {
     ///
     /// If the link target exceeds 100 bytes, it will be stored using the
     /// configured extension mechanism.
-    pub fn link_name(&mut self, link: &[u8]) -> &mut Self {
+    pub fn link_name(&mut self, link: impl AsRef<[u8]>) -> &mut Self {
+        let link = link.as_ref();
         if link.len() > LINKNAME_MAX_LEN {
             self.long_link = Some(link.to_vec());
             let truncated = &link[..LINKNAME_MAX_LEN];
@@ -756,12 +759,13 @@ impl EntryBuilder {
     ///
     /// Returns an error only if the name overflows and PAX fallback is
     /// not available (GNU mode).
-    pub fn username(&mut self, name: &[u8]) -> Result<&mut Self> {
+    pub fn username(&mut self, name: impl AsRef<[u8]>) -> Result<&mut Self> {
+        let name = name.as_ref();
         match self.header.username(name) {
             Ok(_) => Ok(self),
             Err(_) if self.mode == ExtensionMode::Pax => {
                 // Zero the header field and store full name in PAX
-                self.header.username(&[]).expect("empty fits");
+                self.header.username([]).expect("empty fits");
                 self.pax_mut().uname(name);
                 Ok(self)
             }
@@ -779,11 +783,12 @@ impl EntryBuilder {
     ///
     /// Returns an error only if the name overflows and PAX fallback is
     /// not available (GNU mode).
-    pub fn groupname(&mut self, name: &[u8]) -> Result<&mut Self> {
+    pub fn groupname(&mut self, name: impl AsRef<[u8]>) -> Result<&mut Self> {
+        let name = name.as_ref();
         match self.header.groupname(name) {
             Ok(_) => Ok(self),
             Err(_) if self.mode == ExtensionMode::Pax => {
-                self.header.groupname(&[]).expect("empty fits");
+                self.header.groupname([]).expect("empty fits");
                 self.pax_mut().gname(name);
                 Ok(self)
             }
@@ -808,7 +813,7 @@ impl EntryBuilder {
     /// This is useful for adding metadata that doesn't fit in standard
     /// header fields. The PAX extension will be emitted regardless of
     /// the extension mode setting.
-    pub fn add_pax(&mut self, key: &str, value: &[u8]) -> &mut Self {
+    pub fn add_pax(&mut self, key: &str, value: impl AsRef<[u8]>) -> &mut Self {
         self.pax_mut().add(key, value);
         self
     }
