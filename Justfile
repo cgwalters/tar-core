@@ -16,8 +16,13 @@ unit:
         cargo test; \
     fi
 
+# Run cross-language interop tests (requires python3, go)
+interop:
+    cargo test --test interop_python -- --ignored
+    cargo test --test interop_go -- --ignored
+
 # Run all tests
-test-all: unit
+test-all: unit interop
 
 # Full CI check (format, lint, test)
 ci: check unit
