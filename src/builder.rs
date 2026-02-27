@@ -49,25 +49,7 @@ fn write_bytes<const N: usize>(field: &mut [u8; N], value: &[u8]) -> Result<()> 
 ///
 /// Returns [`HeaderError::InvalidOctal`] if the value cannot fit in the field.
 fn write_octal<const N: usize>(field: &mut [u8; N], value: u64) -> Result<()> {
-    // N bytes = N-1 octal digits + null terminator.
-    // All tar header octal fields are at least 8 bytes.
-    let max_digits = N - 1;
-
-    let max_value = if max_digits >= 21 {
-        u64::MAX
-    } else {
-        (1u64 << (max_digits * 3)) - 1
-    };
-
-    if value > max_value {
-        return Err(HeaderError::InvalidOctal(format!("{value:o}").into_bytes()));
-    }
-
-    field.fill(0);
-    let octal_str = format!("{value:0width$o}", width = max_digits);
-    field[..octal_str.len()].copy_from_slice(octal_str.as_bytes());
-
-    Ok(())
+    crate::encode_octal(field.as_mut_slice(), value)
 }
 
 /// Builder for creating tar headers.

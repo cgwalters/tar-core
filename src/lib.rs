@@ -1351,7 +1351,7 @@ pub fn encode_numeric(field: &mut [u8], value: u64) -> Result<()> {
 /// Encode a u64 value as octal ASCII to a field.
 ///
 /// The value is formatted as octal with leading zeros and a trailing null,
-/// following tar conventions.
+/// following tar conventions. Does not allocate.
 ///
 /// # Errors
 ///
@@ -1361,26 +1361,28 @@ pub fn encode_octal(field: &mut [u8], value: u64) -> Result<()> {
         return Err(HeaderError::InvalidOctal(vec![]));
     }
 
-    // Calculate how many octal digits we can fit (leaving room for null terminator)
-    let max_digits = field.len() - 1;
+    // Last byte is the null terminator.
+    let len = field.len();
+    let digits = &mut field[..len - 1];
 
-    // Check if value fits: max value is 8^max_digits - 1
-    let max_value = if max_digits >= 21 {
-        u64::MAX
-    } else {
-        (1u64 << (max_digits * 3)) - 1
-    };
-
-    if value > max_value {
-        return Err(HeaderError::InvalidOctal(format!("{value:o}").into_bytes()));
+    // Check if value fits: N octal digits can represent 0..8^N-1.
+    // 21 octal digits cover all of u64.
+    if digits.len() < 21 {
+        let max_value = (1u64 << (digits.len() * 3)) - 1;
+        if value > max_value {
+            // Format only for the error message (not the hot path).
+            return Err(HeaderError::InvalidOctal(format!("{value:o}").into_bytes()));
+        }
     }
 
-    // Format as octal with leading zeros
-    field.fill(0);
-    let octal_str = format!("{value:0width$o}", width = max_digits);
-    let bytes = octal_str.as_bytes();
-    field[..bytes.len()].copy_from_slice(bytes);
-    // Last byte is already 0 (null terminator) from fill
+    // Fill digits right-to-left via repeated divmod, then pad with '0'.
+    let mut v = value;
+    for slot in digits.iter_mut().rev() {
+        *slot = b'0' + (v & 7) as u8;
+        v >>= 3;
+    }
+    // Null terminator.
+    *field.last_mut().unwrap() = 0;
 
     Ok(())
 }
