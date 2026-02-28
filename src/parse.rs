@@ -317,14 +317,19 @@ pub enum ParseEvent<'a> {
 }
 
 impl<'a> ParseEvent<'a> {
-    /// Add `n` to the consumed byte count in this event.
+    /// Adjust byte offsets in this event to account for `n` bytes that were
+    /// already consumed from the front of the original input before the
+    /// sub-slice was handed to a recursive `parse_header` call.
     ///
-    /// Used when recursing through extension headers to accumulate the total
-    /// bytes consumed. `NeedData` is unchanged because no bytes are committed
-    /// when the parser needs more input (it will re-parse from the start).
+    /// For `Entry` and `End`, `n` is added to `consumed`.
+    ///
+    /// For `NeedData`, `n` is added to `min_bytes` so the requirement is
+    /// expressed relative to the *original* input buffer, not the sub-slice.
     fn add_consumed(self, n: usize) -> Self {
         match self {
-            ev @ ParseEvent::NeedData { .. } => ev,
+            ParseEvent::NeedData { min_bytes } => ParseEvent::NeedData {
+                min_bytes: min_bytes + n,
+            },
             ParseEvent::Entry { consumed, entry } => ParseEvent::Entry {
                 consumed: consumed + n,
                 entry,
@@ -1885,10 +1890,10 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let event = parser.parse(&header).unwrap();
 
-        // Need header (512) + padded content (512)
+        // Need header (512) + padded content (512) = 1024
         match event {
             ParseEvent::NeedData { min_bytes } => {
-                assert!(min_bytes > 512);
+                assert_eq!(min_bytes, 1024);
             }
             other => panic!("Expected NeedData, got {:?}", other),
         }
@@ -1902,9 +1907,41 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let event = parser.parse(&header).unwrap();
 
+        // Need header (512) + padded content (512) = 1024
         match event {
             ParseEvent::NeedData { min_bytes } => {
-                assert!(min_bytes > 512);
+                assert_eq!(min_bytes, 1024);
+            }
+            other => panic!("Expected NeedData, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_need_data_adjusted_through_extension_headers() {
+        // Regression test: NeedData.min_bytes must be relative to the
+        // original buffer, not the recursive sub-slice.
+        //
+        // Provide a complete GNU long name entry (header + content = 1024 bytes)
+        // but no following header. The recursive parse_header call on the
+        // sub-slice needs 512 more bytes for the next header. After
+        // add_consumed(1024), min_bytes must be 1024 + 512 = 1536.
+        let long_name = "long/path/name/".to_string() + &"x".repeat(90);
+        let gnu_entry = make_gnu_long_name(long_name.as_bytes());
+        // gnu_entry is header(512) + padded_content(512) = 1024 bytes
+        assert_eq!(gnu_entry.len(), 1024);
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&gnu_entry).unwrap();
+
+        match event {
+            ParseEvent::NeedData { min_bytes } => {
+                // The recursive call needs 512 bytes (one header) from its
+                // sub-slice. add_consumed(1024) must adjust this to 1536.
+                assert_eq!(
+                    min_bytes, 1536,
+                    "NeedData.min_bytes must account for bytes consumed by \
+                     extension headers (1024 + 512 = 1536)"
+                );
             }
             other => panic!("Expected NeedData, got {:?}", other),
         }
