@@ -24,7 +24,7 @@ use tempfile::TempDir;
 
 use tar_core::builder::EntryBuilder;
 use tar_core::parse::{Limits, ParseEvent, Parser};
-use tar_core::{EntryType, HEADER_SIZE};
+use tar_core::{EntryType, SparseEntry as TarSparseEntry, HEADER_SIZE};
 
 // ============================================================================
 // Go helper program (embedded source)
@@ -328,6 +328,10 @@ struct EntryParams {
     username: Vec<u8>,
     groupname: Vec<u8>,
     content: Vec<u8>,
+    /// Sparse data map (empty for non-sparse entries).
+    sparse_map: Vec<TarSparseEntry>,
+    /// Logical file size for sparse entries (0 for non-sparse).
+    real_size: u64,
 }
 
 /// Build a tar archive from entry params using tar-core's EntryBuilder.
@@ -392,6 +396,78 @@ fn build_tar_core_archive(entries: &[EntryParams], format: &str) -> Vec<u8> {
     archive
 }
 
+/// Build a sparse tar archive from entry params using tar-core's EntryBuilder.
+///
+/// Entries with non-empty `sparse_map` are written as sparse files. The
+/// `content` field holds only the data region bytes (concatenated), and
+/// `real_size` is the logical file size.
+fn build_sparse_tar_core_archive(entries: &[EntryParams], format: &str) -> Vec<u8> {
+    let mut archive = Vec::new();
+
+    for entry in entries {
+        let mut builder = match format {
+            "gnu" => EntryBuilder::new_gnu(),
+            "pax" => EntryBuilder::new_ustar(),
+            _ => panic!("unknown format: {format}"),
+        };
+
+        builder
+            .path(&entry.path)
+            .mode(entry.mode)
+            .unwrap()
+            .uid(entry.uid as u64)
+            .unwrap()
+            .gid(entry.gid as u64)
+            .unwrap()
+            .mtime(entry.mtime as u64)
+            .unwrap()
+            .entry_type(EntryType::Regular);
+
+        if format == "gnu" {
+            let uname = if entry.username.len() > 32 {
+                &entry.username[..32]
+            } else {
+                &entry.username
+            };
+            let gname = if entry.groupname.len() > 32 {
+                &entry.groupname[..32]
+            } else {
+                &entry.groupname
+            };
+            builder.username(uname).unwrap();
+            builder.groupname(gname).unwrap();
+        } else {
+            builder.username(&entry.username).unwrap();
+            builder.groupname(&entry.groupname).unwrap();
+        }
+
+        if !entry.sparse_map.is_empty() {
+            // Sparse entry: size is the on-disk content length
+            builder
+                .size(entry.content.len() as u64)
+                .unwrap()
+                .sparse(&entry.sparse_map, entry.real_size);
+        } else {
+            builder.size(entry.content.len() as u64).unwrap();
+        }
+
+        let header_bytes = builder.finish_bytes();
+        archive.extend_from_slice(&header_bytes);
+
+        // Write content (for sparse entries, this is the concatenated data regions)
+        archive.extend_from_slice(&entry.content);
+
+        // Pad to 512-byte boundary
+        let padding = (HEADER_SIZE - (entry.content.len() % HEADER_SIZE)) % HEADER_SIZE;
+        archive.extend(std::iter::repeat_n(0u8, padding));
+    }
+
+    // End-of-archive: two 512-byte zero blocks
+    archive.extend(std::iter::repeat_n(0u8, HEADER_SIZE * 2));
+
+    archive
+}
+
 /// Parse a tar archive using tar-core's sans-IO parser.
 fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
     let mut parser = Parser::new(Limits::default());
@@ -430,10 +506,44 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
                     username: uname,
                     groupname: gname,
                     content,
+                    sparse_map: Vec::new(),
+                    real_size: 0,
                 });
             }
-            ParseEvent::SparseEntry { .. } => {
-                panic!("unexpected SparseEntry in interop test");
+            ParseEvent::SparseEntry {
+                consumed,
+                entry,
+                sparse_map,
+                real_size,
+            } => {
+                offset += consumed;
+
+                let path = entry.path.to_vec();
+                let mode = entry.mode;
+                let uid = entry.uid as u32;
+                let gid = entry.gid as u32;
+                let size = entry.size as usize;
+                let mtime = entry.mtime as u32;
+                let uname = entry.uname.as_ref().map(|u| u.to_vec()).unwrap_or_default();
+                let gname = entry.gname.as_ref().map(|g| g.to_vec()).unwrap_or_default();
+
+                // Read the on-disk content (sparse data regions only)
+                let content = data[offset..offset + size].to_vec();
+                let padded_size = size.next_multiple_of(HEADER_SIZE);
+                offset += padded_size;
+
+                results.push(EntryParams {
+                    path,
+                    mode,
+                    uid,
+                    gid,
+                    mtime,
+                    username: uname,
+                    groupname: gname,
+                    content,
+                    sparse_map,
+                    real_size,
+                });
             }
             ParseEvent::End { .. } => break,
         }
@@ -620,6 +730,8 @@ fn to_entry_params(raw: &RawEntryParams) -> Option<EntryParams> {
         username,
         groupname,
         content,
+        sparse_map: Vec::new(),
+        real_size: 0,
     })
 }
 
@@ -715,6 +827,8 @@ fn smoke_test_roundtrip(sh: &Shell) {
             username: b"testuser".to_vec(),
             groupname: b"testgroup".to_vec(),
             content: b"Hello, World!".to_vec(),
+            sparse_map: Vec::new(),
+            real_size: 0,
         },
         EntryParams {
             path: b"empty.txt".to_vec(),
@@ -725,6 +839,8 @@ fn smoke_test_roundtrip(sh: &Shell) {
             username: b"root".to_vec(),
             groupname: b"root".to_vec(),
             content: vec![],
+            sparse_map: Vec::new(),
+            real_size: 0,
         },
         EntryParams {
             // Long path > 100 bytes
@@ -740,6 +856,8 @@ fn smoke_test_roundtrip(sh: &Shell) {
             username: b"nobody".to_vec(),
             groupname: b"nogroup".to_vec(),
             content: vec![0xAB; 512],
+            sparse_map: Vec::new(),
+            real_size: 0,
         },
     ];
 
@@ -760,6 +878,8 @@ fn smoke_test_pax_long_uname(sh: &Shell) {
         username: b"a_very_long_username_that_exceeds_32_bytes_easily".to_vec(),
         groupname: b"shortgrp".to_vec(),
         content: vec![42; 64],
+        sparse_map: Vec::new(),
+        real_size: 0,
     }];
 
     roundtrip_test(sh, &entries, "pax");
@@ -776,10 +896,158 @@ fn smoke_test_non_utf8_path(sh: &Shell) {
         username: vec![b'u', 0xC0, b's', b'r'],
         groupname: b"grp".to_vec(),
         content: b"non-utf8 path test".to_vec(),
+        sparse_map: Vec::new(),
+        real_size: 0,
     }];
 
     // GNU handles arbitrary bytes; PAX requires UTF-8 for paths, so only test GNU
     roundtrip_test(sh, &entries, "gnu");
+}
+
+// ============================================================================
+// Sparse roundtrip helpers
+// ============================================================================
+
+/// Expand sparse data regions into a full logical buffer (holes are zeroed).
+fn expand_sparse_content(sparse_map: &[TarSparseEntry], data: &[u8], real_size: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; real_size as usize];
+    let mut data_offset = 0usize;
+    for region in sparse_map {
+        let len = region.length as usize;
+        let dst_start = region.offset as usize;
+        buf[dst_start..dst_start + len].copy_from_slice(&data[data_offset..data_offset + len]);
+        data_offset += len;
+    }
+    buf
+}
+
+/// Test: tar-core builds a sparse archive → Go parses it correctly.
+///
+/// We verify that Go sees the correct logical size and that reading the
+/// content through Go's sparse-aware reader produces the expected bytes
+/// (data regions filled, holes zeroed).
+fn test_sparse_tar_core_to_go(sh: &Shell, format: &str) {
+    let go_bin = go_helper_bin(sh);
+    let tmp = TempDir::new().expect("create tempdir");
+
+    // Create a sparse entry: 1024-byte logical file with two data regions.
+    //   [0..10):   "AAAAAAAAAA"
+    //   [512..522): "BBBBBBBBBB"
+    // Everything else is zero (holes).
+    let sparse_map = vec![
+        TarSparseEntry {
+            offset: 0,
+            length: 10,
+        },
+        TarSparseEntry {
+            offset: 512,
+            length: 10,
+        },
+    ];
+    let real_size: u64 = 1024;
+    // On-disk content is the concatenation of data regions.
+    let mut on_disk_content = Vec::new();
+    on_disk_content.extend_from_slice(&[b'A'; 10]);
+    on_disk_content.extend_from_slice(&[b'B'; 10]);
+
+    let entry = EntryParams {
+        path: b"sparse.dat".to_vec(),
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+        mtime: 1700000000,
+        username: b"user".to_vec(),
+        groupname: b"group".to_vec(),
+        content: on_disk_content.clone(),
+        sparse_map: sparse_map.clone(),
+        real_size,
+    };
+
+    let archive_data = build_sparse_tar_core_archive(&[entry], format);
+    let tar_path = tmp.path().join("sparse_rust.tar");
+    std::fs::write(&tar_path, &archive_data).expect("write sparse tar");
+
+    let go_parsed = run_go_parse(sh, go_bin, &tar_path);
+    assert_eq!(go_parsed.len(), 1, "expected 1 entry from Go");
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let go_entry = &go_parsed[0];
+
+    let go_path = b64.decode(&go_entry.path).unwrap();
+    assert_eq!(go_path, b"sparse.dat", "path mismatch");
+
+    // Go should report the logical size
+    assert_eq!(
+        go_entry.size, real_size as i64,
+        "Go should see logical size {real_size}, got {}",
+        go_entry.size
+    );
+
+    // Go's content should be the fully expanded file
+    let go_content = b64.decode(&go_entry.content).unwrap();
+    let expected_content = expand_sparse_content(&sparse_map, &on_disk_content, real_size);
+    assert_eq!(
+        go_content, expected_content,
+        "expanded sparse content mismatch (format={format})"
+    );
+}
+
+/// Test: tar-core sparse roundtrip (build → parse).
+///
+/// Verifies that tar-core can re-parse its own sparse archives, recovering
+/// the sparse map, real size, and on-disk data correctly.
+fn test_sparse_tar_core_roundtrip(format: &str) {
+    let sparse_map = vec![
+        TarSparseEntry {
+            offset: 0,
+            length: 10,
+        },
+        TarSparseEntry {
+            offset: 512,
+            length: 10,
+        },
+    ];
+    let real_size: u64 = 1024;
+    let mut on_disk_content = Vec::new();
+    on_disk_content.extend_from_slice(&[b'A'; 10]);
+    on_disk_content.extend_from_slice(&[b'B'; 10]);
+
+    let entry = EntryParams {
+        path: b"sparse_roundtrip.dat".to_vec(),
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+        mtime: 1700000000,
+        username: b"user".to_vec(),
+        groupname: b"group".to_vec(),
+        content: on_disk_content.clone(),
+        sparse_map: sparse_map.clone(),
+        real_size,
+    };
+
+    let archive_data = build_sparse_tar_core_archive(&[entry], format);
+    let parsed = parse_tar_core_archive(&archive_data);
+    assert_eq!(parsed.len(), 1, "expected 1 entry");
+
+    let result = &parsed[0];
+    assert_eq!(result.path, b"sparse_roundtrip.dat");
+    assert_eq!(
+        result.real_size, real_size,
+        "real_size mismatch (format={format})"
+    );
+    assert_eq!(
+        result.sparse_map.len(),
+        2,
+        "expected 2 sparse data regions (format={format})"
+    );
+    assert_eq!(result.sparse_map[0].offset, 0);
+    assert_eq!(result.sparse_map[0].length, 10);
+    assert_eq!(result.sparse_map[1].offset, 512);
+    assert_eq!(result.sparse_map[1].length, 10);
+    assert_eq!(
+        result.content, on_disk_content,
+        "on-disk content mismatch (format={format})"
+    );
 }
 
 // ============================================================================
@@ -809,6 +1077,19 @@ fn main() {
     println!("smoke_test_non_utf8_path...");
     smoke_test_non_utf8_path(&sh);
     println!("smoke_test_non_utf8_path: PASSED");
+
+    // Sparse roundtrip tests
+    for format in &["gnu", "pax"] {
+        println!("test_sparse_tar_core_to_go ({format})...");
+        test_sparse_tar_core_to_go(&sh, format);
+        println!("test_sparse_tar_core_to_go ({format}): PASSED");
+    }
+
+    for format in &["gnu", "pax"] {
+        println!("test_sparse_tar_core_roundtrip ({format})...");
+        test_sparse_tar_core_roundtrip(format);
+        println!("test_sparse_tar_core_roundtrip ({format}): PASSED");
+    }
 
     // Arbitrary-driven tests
     run_random_tests("roundtrip_gnu", 32, |entries| {
