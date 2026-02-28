@@ -1,21 +1,23 @@
 //! Cross-language roundtrip integration test: tar-core <-> Go archive/tar.
 //!
 //! This test validates that tar archives built by tar-core can be correctly
-//! parsed by Go's archive/tar package, and vice versa. It uses proptest to
-//! generate random entry parameters and tests both GNU and PAX extension modes.
+//! parsed by Go's archive/tar package, and vice versa. It uses the `arbitrary`
+//! crate to generate random entry parameters and tests both GNU and PAX
+//! extension modes.
+//!
+//! Paths and names are `Vec<u8>` (not `String`) to exercise non-UTF-8 byte
+//! sequences — tar paths are fundamentally byte sequences.  The JSON protocol
+//! base64-encodes path, uname, and gname fields.
 //!
 //! Requires Go 1.23+. Run with:
-//!   GOPATH=$HOME/gopath PATH=$HOME/go/bin:$PATH cargo test --test interop_go -- --ignored --nocapture
-
-#![allow(missing_docs)]
-#![cfg(unix)]
+//!   GOPATH=$HOME/gopath PATH=$HOME/go/bin:$PATH cargo run --example interop-go
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use arbitrary::{Arbitrary, Unstructured};
 use base64::Engine;
-use proptest::prelude::*;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
@@ -47,15 +49,15 @@ type Command struct {
 }
 
 type Entry struct {
-	Path    string `json:"path"`
+	Path    string `json:"path"`    // base64-encoded raw bytes
 	Mode    int64  `json:"mode"`
 	Uid     int    `json:"uid"`
 	Gid     int    `json:"gid"`
 	Size    int64  `json:"size"`
 	Mtime   int64  `json:"mtime"`
-	Uname   string `json:"uname"`
-	Gname   string `json:"gname"`
-	Content string `json:"content"` // base64
+	Uname   string `json:"uname"`  // base64-encoded raw bytes
+	Gname   string `json:"gname"`  // base64-encoded raw bytes
+	Content string `json:"content"` // base64-encoded
 }
 
 func parseTar(path string) {
@@ -87,15 +89,16 @@ func parseTar(path string) {
 			}
 		}
 
+		// Go strings are byte slices, so we can base64-encode them directly
 		entries = append(entries, Entry{
-			Path:    hdr.Name,
+			Path:    base64.StdEncoding.EncodeToString([]byte(hdr.Name)),
 			Mode:    int64(hdr.Mode),
 			Uid:     hdr.Uid,
 			Gid:     hdr.Gid,
 			Size:    hdr.Size,
 			Mtime:   hdr.ModTime.Unix(),
-			Uname:   hdr.Uname,
-			Gname:   hdr.Gname,
+			Uname:   base64.StdEncoding.EncodeToString([]byte(hdr.Uname)),
+			Gname:   base64.StdEncoding.EncodeToString([]byte(hdr.Gname)),
 			Content: base64.StdEncoding.EncodeToString(content),
 		})
 	}
@@ -117,7 +120,23 @@ func generateTar(cmd Command) {
 	for _, e := range cmd.Entries {
 		content, err := base64.StdEncoding.DecodeString(e.Content)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "base64 decode: %v\n", err)
+			fmt.Fprintf(os.Stderr, "base64 decode content: %v\n", err)
+			os.Exit(1)
+		}
+
+		pathBytes, err := base64.StdEncoding.DecodeString(e.Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "base64 decode path: %v\n", err)
+			os.Exit(1)
+		}
+		unameBytes, err := base64.StdEncoding.DecodeString(e.Uname)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "base64 decode uname: %v\n", err)
+			os.Exit(1)
+		}
+		gnameBytes, err := base64.StdEncoding.DecodeString(e.Gname)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "base64 decode gname: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -133,14 +152,14 @@ func generateTar(cmd Command) {
 
 		hdr := &tar.Header{
 			Typeflag: tar.TypeReg,
-			Name:     e.Path,
+			Name:     string(pathBytes),
 			Mode:     e.Mode,
 			Uid:      e.Uid,
 			Gid:      e.Gid,
 			Size:     int64(len(content)),
 			ModTime:  timeFromUnix(e.Mtime),
-			Uname:    e.Uname,
-			Gname:    e.Gname,
+			Uname:    string(unameBytes),
+			Gname:    string(gnameBytes),
 			Format:   format,
 		}
 
@@ -204,15 +223,15 @@ struct GoCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GoEntry {
-    path: String,
+    path: String, // base64-encoded raw bytes
     mode: i64,
     uid: i32,
     gid: i32,
     size: i64,
     mtime: i64,
-    uname: String,
-    gname: String,
-    content: String, // base64
+    uname: String,   // base64-encoded raw bytes
+    gname: String,   // base64-encoded raw bytes
+    content: String, // base64-encoded
 }
 
 // ============================================================================
@@ -338,20 +357,17 @@ fn run_go_generate(go_bin: &Path, tar_path: &Path, format: &str, entries: Vec<Go
 /// Parameters for a single tar entry.
 #[derive(Debug, Clone)]
 struct EntryParams {
-    path: String,
+    path: Vec<u8>,
     mode: u32,
     uid: u32,
     gid: u32,
-    #[allow(dead_code)]
-    size: usize,
     mtime: u32,
-    username: String,
-    groupname: String,
+    username: Vec<u8>,
+    groupname: Vec<u8>,
     content: Vec<u8>,
 }
 
 /// Build a tar archive from entry params using tar-core's EntryBuilder.
-/// `format` is "gnu" or "pax".
 fn build_tar_core_archive(entries: &[EntryParams], format: &str) -> Vec<u8> {
     let mut archive = Vec::new();
 
@@ -363,7 +379,7 @@ fn build_tar_core_archive(entries: &[EntryParams], format: &str) -> Vec<u8> {
         };
 
         builder
-            .path(entry.path.as_bytes())
+            .path(&entry.path)
             .mode(entry.mode)
             .unwrap()
             .uid(entry.uid as u64)
@@ -389,11 +405,11 @@ fn build_tar_core_archive(entries: &[EntryParams], format: &str) -> Vec<u8> {
             } else {
                 &entry.groupname
             };
-            builder.username(uname.as_bytes()).unwrap();
-            builder.groupname(gname.as_bytes()).unwrap();
+            builder.username(uname).unwrap();
+            builder.groupname(gname).unwrap();
         } else {
-            builder.username(entry.username.as_bytes()).unwrap();
-            builder.groupname(entry.groupname.as_bytes()).unwrap();
+            builder.username(&entry.username).unwrap();
+            builder.groupname(&entry.groupname).unwrap();
         }
 
         let header_bytes = builder.finish_bytes();
@@ -414,7 +430,6 @@ fn build_tar_core_archive(entries: &[EntryParams], format: &str) -> Vec<u8> {
 }
 
 /// Parse a tar archive using tar-core's sans-IO parser.
-/// Returns a list of (path, mode, uid, gid, size, mtime, uname, gname, content).
 fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
     let mut parser = Parser::new(Limits::default());
     let mut results = Vec::new();
@@ -429,22 +444,14 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
             ParseEvent::Entry { consumed, entry } => {
                 offset += consumed;
 
-                let path = String::from_utf8_lossy(&entry.path).into_owned();
+                let path = entry.path.to_vec();
                 let mode = entry.mode;
                 let uid = entry.uid as u32;
                 let gid = entry.gid as u32;
                 let size = entry.size as usize;
                 let mtime = entry.mtime as u32;
-                let uname = entry
-                    .uname
-                    .as_ref()
-                    .map(|u| String::from_utf8_lossy(u).into_owned())
-                    .unwrap_or_default();
-                let gname = entry
-                    .gname
-                    .as_ref()
-                    .map(|g| String::from_utf8_lossy(g).into_owned())
-                    .unwrap_or_default();
+                let uname = entry.uname.as_ref().map(|u| u.to_vec()).unwrap_or_default();
+                let gname = entry.gname.as_ref().map(|g| g.to_vec()).unwrap_or_default();
 
                 // Read content
                 let content = data[offset..offset + size].to_vec();
@@ -459,7 +466,6 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
                     mode,
                     uid,
                     gid,
-                    size,
                     mtime,
                     username: uname,
                     groupname: gname,
@@ -468,7 +474,7 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
             }
             ParseEvent::End { consumed } => {
                 offset += consumed;
-                let _ = offset; // suppress unused warning
+                let _ = offset;
                 break;
             }
         }
@@ -481,7 +487,9 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
 // Comparison helpers
 // ============================================================================
 
-fn assert_entries_match(label: &str, expected: &[EntryParams], actual: &[GoEntry]) {
+fn assert_entries_match_go(label: &str, expected: &[EntryParams], actual: &[GoEntry]) {
+    let b64 = base64::engine::general_purpose::STANDARD;
+
     assert_eq!(
         expected.len(),
         actual.len(),
@@ -490,10 +498,18 @@ fn assert_entries_match(label: &str, expected: &[EntryParams], actual: &[GoEntry
         actual.len()
     );
 
-    let b64 = base64::engine::general_purpose::STANDARD;
-
     for (i, (exp, act)) in expected.iter().zip(actual.iter()).enumerate() {
-        assert_eq!(exp.path, act.path, "{label} entry[{i}]: path mismatch");
+        let act_path = b64
+            .decode(&act.path)
+            .unwrap_or_else(|e| panic!("{label} entry[{i}]: bad base64 path: {e}"));
+        let act_uname = b64
+            .decode(&act.uname)
+            .unwrap_or_else(|e| panic!("{label} entry[{i}]: bad base64 uname: {e}"));
+        let act_gname = b64
+            .decode(&act.gname)
+            .unwrap_or_else(|e| panic!("{label} entry[{i}]: bad base64 gname: {e}"));
+
+        assert_eq!(exp.path, act_path, "{label} entry[{i}]: path mismatch");
         assert_eq!(
             exp.mode as i64, act.mode,
             "{label} entry[{i}]: mode mismatch (expected 0o{:o}, got 0o{:o})",
@@ -509,6 +525,15 @@ fn assert_entries_match(label: &str, expected: &[EntryParams], actual: &[GoEntry
         assert_eq!(
             exp.mtime as i64, act.mtime,
             "{label} entry[{i}]: mtime mismatch"
+        );
+
+        assert_eq!(
+            exp.username, act_uname,
+            "{label} entry[{i}]: uname mismatch"
+        );
+        assert_eq!(
+            exp.groupname, act_gname,
+            "{label} entry[{i}]: gname mismatch"
         );
 
         // Content comparison
@@ -548,6 +573,14 @@ fn assert_parsed_entries_match(label: &str, expected: &[EntryParams], actual: &[
         );
         assert_eq!(exp.mtime, act.mtime, "{label} entry[{i}]: mtime mismatch");
         assert_eq!(
+            exp.username, act.username,
+            "{label} entry[{i}]: uname mismatch"
+        );
+        assert_eq!(
+            exp.groupname, act.groupname,
+            "{label} entry[{i}]: gname mismatch"
+        );
+        assert_eq!(
             exp.content, act.content,
             "{label} entry[{i}]: content mismatch"
         );
@@ -559,154 +592,97 @@ fn entries_to_go(entries: &[EntryParams]) -> Vec<GoEntry> {
     entries
         .iter()
         .map(|e| GoEntry {
-            path: e.path.clone(),
+            path: b64.encode(&e.path),
             mode: e.mode as i64,
             uid: e.uid as i32,
             gid: e.gid as i32,
             size: e.content.len() as i64,
             mtime: e.mtime as i64,
-            uname: e.username.clone(),
-            gname: e.groupname.clone(),
+            uname: b64.encode(&e.username),
+            gname: b64.encode(&e.groupname),
             content: b64.encode(&e.content),
         })
         .collect()
 }
 
 // ============================================================================
-// Proptest strategies
+// Arbitrary-based random test generation
 // ============================================================================
 
-/// Generate an ASCII path segment: alphanumeric characters.
-fn path_segment() -> impl Strategy<Value = String> {
-    proptest::string::string_regex("[a-zA-Z0-9][a-zA-Z0-9_]{0,19}")
-        .expect("valid regex")
-        .prop_filter("non-empty", |s| !s.is_empty())
+#[derive(Debug, Clone, Arbitrary)]
+struct RawEntryParams {
+    path_bytes: Vec<u8>,
+    mode: u16,
+    uid: u16,
+    gid: u16,
+    content_len: u8,
+    mtime: u32,
+    uname_bytes: Vec<u8>,
+    gname_bytes: Vec<u8>,
+    content_seed: Vec<u8>,
 }
 
-/// Generate a path of 1-200 bytes with slashes.
-fn path_strategy(min_len: usize, max_len: usize) -> impl Strategy<Value = String> {
-    prop::collection::vec(path_segment(), 1..=10)
-        .prop_map(|segments| segments.join("/"))
-        .prop_filter("length in range", move |s| {
-            s.len() >= min_len && s.len() <= max_len
-        })
+/// Remove NUL bytes and clamp length.
+fn sanitize_bytes(raw: &[u8], min_len: usize, max_len: usize) -> Option<Vec<u8>> {
+    let mut out: Vec<u8> = raw.iter().copied().filter(|&b| b != 0).collect();
+    if out.is_empty() {
+        out.push(b'x');
+    }
+    out.truncate(max_len);
+    if out.len() < min_len {
+        return None;
+    }
+    Some(out)
 }
 
-/// Short path that fits in 100-byte name field.
-fn short_path_strategy() -> impl Strategy<Value = String> {
-    path_strategy(1, 95)
+fn to_entry_params(raw: &RawEntryParams) -> Option<EntryParams> {
+    let path = sanitize_bytes(&raw.path_bytes, 1, 200)?;
+    let username = sanitize_bytes(&raw.uname_bytes, 1, 64)?;
+    let groupname = sanitize_bytes(&raw.gname_bytes, 1, 64)?;
+
+    let content_len = raw.content_len as usize * 32; // 0..8160
+    let content: Vec<u8> = if content_len == 0 || raw.content_seed.is_empty() {
+        vec![0u8; content_len]
+    } else {
+        raw.content_seed
+            .iter()
+            .copied()
+            .cycle()
+            .take(content_len)
+            .collect()
+    };
+
+    Some(EntryParams {
+        path,
+        mode: (raw.mode as u32) & 0o7777,
+        uid: raw.uid as u32,
+        gid: raw.gid as u32,
+        mtime: raw.mtime & 0x7FFFFFFF,
+        username,
+        groupname,
+        content,
+    })
 }
 
-/// Long path that exceeds 100 bytes (triggers extensions).
-fn long_path_strategy() -> impl Strategy<Value = String> {
-    path_strategy(101, 200)
-}
-
-/// Username/groupname: 1-64 ASCII alphanumeric bytes.
-fn name_strategy(max_len: usize) -> impl Strategy<Value = String> {
-    proptest::string::string_regex(&format!("[a-zA-Z][a-zA-Z0-9_]{{0,{}}}", max_len - 1))
-        .expect("valid regex")
-        .prop_filter("non-empty", |s| !s.is_empty())
-        .prop_filter("length ok", move |s| s.len() <= max_len)
-}
-
-/// Username that fits in the 32-byte header field.
-fn short_username_strategy() -> impl Strategy<Value = String> {
-    name_strategy(31)
-}
-
-/// Username that exceeds 32 bytes (triggers PAX uname extension).
-fn long_username_strategy() -> impl Strategy<Value = String> {
-    proptest::string::string_regex("[a-zA-Z][a-zA-Z0-9_]{32,50}")
-        .expect("valid regex")
-        .prop_filter("long enough", |s| s.len() > 32)
-}
-
-fn content_strategy(max_size: usize) -> impl Strategy<Value = Vec<u8>> {
-    (0..=max_size).prop_flat_map(|size| prop::collection::vec(any::<u8>(), size..=size))
-}
-
-fn entry_params_strategy() -> impl Strategy<Value = EntryParams> {
-    (
-        short_path_strategy(),
-        0u32..0o7777u32,
-        0u32..65535u32,
-        0u32..65535u32,
-        0usize..4096usize,
-        // Use a range that fits in both GNU octal and Go's time handling.
-        // GNU 12-byte octal max is 0o77777777777 (~8.5 billion), but we
-        // keep it within a reasonable range.
-        0u32..0x7FFFFFFFu32,
-        short_username_strategy(),
-        name_strategy(31),
-    )
-        .prop_flat_map(|(path, mode, uid, gid, size, mtime, username, groupname)| {
-            content_strategy(size).prop_map(move |content| EntryParams {
-                path: path.clone(),
-                mode,
-                uid,
-                gid,
-                size: content.len(),
-                mtime,
-                username: username.clone(),
-                groupname: groupname.clone(),
-                content,
-            })
-        })
-}
-
-/// Entry with a long path (> 100 bytes).
-fn long_path_entry_strategy() -> impl Strategy<Value = EntryParams> {
-    (
-        long_path_strategy(),
-        0u32..0o7777u32,
-        0u32..65535u32,
-        0u32..65535u32,
-        0usize..2048usize,
-        0u32..0x7FFFFFFFu32,
-        short_username_strategy(),
-        name_strategy(31),
-    )
-        .prop_flat_map(|(path, mode, uid, gid, size, mtime, username, groupname)| {
-            content_strategy(size).prop_map(move |content| EntryParams {
-                path: path.clone(),
-                mode,
-                uid,
-                gid,
-                size: content.len(),
-                mtime,
-                username: username.clone(),
-                groupname: groupname.clone(),
-                content,
-            })
-        })
-}
-
-/// Entry with a long username (> 32 bytes) — for PAX mode testing.
-fn long_uname_entry_strategy() -> impl Strategy<Value = EntryParams> {
-    (
-        short_path_strategy(),
-        0u32..0o7777u32,
-        0u32..65535u32,
-        0u32..65535u32,
-        0usize..2048usize,
-        0u32..0x7FFFFFFFu32,
-        long_username_strategy(),
-        name_strategy(31),
-    )
-        .prop_flat_map(|(path, mode, uid, gid, size, mtime, username, groupname)| {
-            content_strategy(size).prop_map(move |content| EntryParams {
-                path: path.clone(),
-                mode,
-                uid,
-                gid,
-                size: content.len(),
-                mtime,
-                username: username.clone(),
-                groupname: groupname.clone(),
-                content,
-            })
-        })
+fn run_random_tests(name: &str, iterations: u32, test_fn: impl Fn(&[EntryParams])) {
+    println!("  {name}...");
+    for seed in 0..iterations {
+        let mut rng_data = Vec::new();
+        let mut state: u64 = seed as u64 ^ 0xdeadbeef;
+        for _ in 0..4096 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng_data.push((state >> 33) as u8);
+        }
+        let mut u = Unstructured::new(&rng_data);
+        if let Ok(raw_entries) = Vec::<RawEntryParams>::arbitrary(&mut u) {
+            let entries: Vec<EntryParams> =
+                raw_entries.iter().filter_map(to_entry_params).collect();
+            if !entries.is_empty() {
+                test_fn(&entries);
+            }
+        }
+    }
+    println!("  {name}: PASSED");
 }
 
 // ============================================================================
@@ -734,33 +710,21 @@ fn roundtrip_test(entries: &[EntryParams], format: &str) {
             let mut e = e.clone();
             if format == "gnu" {
                 if e.username.len() > 32 {
-                    e.username = e.username[..32].to_string();
+                    e.username.truncate(32);
                 }
                 if e.groupname.len() > 32 {
-                    e.groupname = e.groupname[..32].to_string();
+                    e.groupname.truncate(32);
                 }
             }
             e
         })
         .collect();
 
-    assert_entries_match(
+    assert_entries_match_go(
         &format!("tar-core->{format}->Go"),
         &expected_for_go,
         &go_parsed,
     );
-
-    // Also verify uname/gname from Go's output
-    for (i, (exp, act)) in expected_for_go.iter().zip(go_parsed.iter()).enumerate() {
-        assert_eq!(
-            exp.username, act.uname,
-            "tar-core->{format}->Go entry[{i}]: uname mismatch"
-        );
-        assert_eq!(
-            exp.groupname, act.gname,
-            "tar-core->{format}->Go entry[{i}]: gname mismatch"
-        );
-    }
 
     // -- Direction 2: Go -> tar-core --
     let go_tar_path = tmp.path().join("go_built.tar");
@@ -775,145 +739,137 @@ fn roundtrip_test(entries: &[EntryParams], format: &str) {
         &expected_for_go,
         &rust_parsed,
     );
-
-    // Also verify uname/gname from tar-core's parse
-    for (i, (exp, act)) in expected_for_go.iter().zip(rust_parsed.iter()).enumerate() {
-        assert_eq!(
-            exp.username, act.username,
-            "Go->{format}->tar-core entry[{i}]: uname mismatch"
-        );
-        assert_eq!(
-            exp.groupname, act.groupname,
-            "Go->{format}->tar-core entry[{i}]: gname mismatch"
-        );
-    }
 }
 
 // ============================================================================
-// Tests
+// Deterministic smoke tests
 // ============================================================================
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(16))]
-
-    /// Roundtrip with GNU format and short paths.
-    #[test]
-    #[ignore]
-    fn roundtrip_gnu_short(entries in prop::collection::vec(entry_params_strategy(), 1..4)) {
-        roundtrip_test(&entries, "gnu");
-    }
-
-    /// Roundtrip with PAX format and short paths.
-    #[test]
-    #[ignore]
-    fn roundtrip_pax_short(entries in prop::collection::vec(entry_params_strategy(), 1..4)) {
-        roundtrip_test(&entries, "pax");
-    }
-
-    /// Roundtrip with GNU format and long paths (>100 bytes, triggers LongName).
-    #[test]
-    #[ignore]
-    fn roundtrip_gnu_long_path(entry in long_path_entry_strategy()) {
-        roundtrip_test(&[entry], "gnu");
-    }
-
-    /// Roundtrip with PAX format and long paths (>100 bytes, triggers PAX path).
-    #[test]
-    #[ignore]
-    fn roundtrip_pax_long_path(entry in long_path_entry_strategy()) {
-        roundtrip_test(&[entry], "pax");
-    }
-
-    /// Roundtrip with PAX format and long usernames (>32 bytes, triggers PAX uname).
-    #[test]
-    #[ignore]
-    fn roundtrip_pax_long_uname(entry in long_uname_entry_strategy()) {
-        roundtrip_test(&[entry], "pax");
-    }
-
-    /// Mixed entries: combine short paths, long paths, and various content sizes.
-    #[test]
-    #[ignore]
-    fn roundtrip_mixed_gnu(
-        short in entry_params_strategy(),
-        long in long_path_entry_strategy(),
-    ) {
-        roundtrip_test(&[short, long], "gnu");
-    }
-
-    #[test]
-    #[ignore]
-    fn roundtrip_mixed_pax(
-        short in entry_params_strategy(),
-        long in long_path_entry_strategy(),
-    ) {
-        roundtrip_test(&[short, long], "pax");
-    }
-}
-
-/// Deterministic smoke test to catch basic issues without proptest.
-#[test]
-#[ignore]
 fn smoke_test_roundtrip() {
     let entries = vec![
         EntryParams {
-            path: "hello.txt".into(),
+            path: b"hello.txt".to_vec(),
             mode: 0o644,
             uid: 1000,
             gid: 1000,
-            size: 13,
             mtime: 1234567890,
-            username: "testuser".into(),
-            groupname: "testgroup".into(),
+            username: b"testuser".to_vec(),
+            groupname: b"testgroup".to_vec(),
             content: b"Hello, World!".to_vec(),
         },
         EntryParams {
-            path: "empty.txt".into(),
+            path: b"empty.txt".to_vec(),
             mode: 0o600,
             uid: 0,
             gid: 0,
-            size: 0,
             mtime: 0,
-            username: "root".into(),
-            groupname: "root".into(),
+            username: b"root".to_vec(),
+            groupname: b"root".to_vec(),
             content: vec![],
         },
         EntryParams {
             // Long path > 100 bytes
-            path: format!("very/long/path/{}", "x".repeat(100)),
+            path: {
+                let mut p = b"very/long/path/".to_vec();
+                p.extend(std::iter::repeat_n(b'x', 100));
+                p
+            },
             mode: 0o755,
             uid: 65534,
             gid: 65534,
-            size: 512,
             mtime: 1700000000,
-            username: "nobody".into(),
-            groupname: "nogroup".into(),
+            username: b"nobody".to_vec(),
+            groupname: b"nogroup".to_vec(),
             content: vec![0xAB; 512],
         },
     ];
 
     for format in &["gnu", "pax"] {
-        eprintln!("--- smoke test: {format} ---");
+        println!("  smoke_test_roundtrip ({format})...");
         roundtrip_test(&entries, format);
-        eprintln!("--- smoke test: {format} PASSED ---");
+        println!("  smoke_test_roundtrip ({format}): PASSED");
     }
 }
 
-/// Test with long username in PAX mode specifically.
-#[test]
-#[ignore]
 fn smoke_test_pax_long_uname() {
     let entries = vec![EntryParams {
-        path: "file_with_long_uname.dat".into(),
+        path: b"file_with_long_uname.dat".to_vec(),
         mode: 0o644,
         uid: 1000,
         gid: 1000,
-        size: 64,
         mtime: 1234567890,
-        username: "a_very_long_username_that_exceeds_32_bytes_easily".into(),
-        groupname: "shortgrp".into(),
+        username: b"a_very_long_username_that_exceeds_32_bytes_easily".to_vec(),
+        groupname: b"shortgrp".to_vec(),
         content: vec![42; 64],
     }];
 
     roundtrip_test(&entries, "pax");
+}
+
+fn smoke_test_non_utf8_path() {
+    // Path containing bytes > 127 that aren't valid UTF-8
+    let entries = vec![EntryParams {
+        path: vec![b'f', b'i', b'l', b'e', 0x80, 0xFE, b'.', b'd', b'a', b't'],
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+        mtime: 1700000000,
+        username: vec![b'u', 0xC0, b's', b'r'],
+        groupname: b"grp".to_vec(),
+        content: b"non-utf8 path test".to_vec(),
+    }];
+
+    // GNU handles arbitrary bytes; PAX requires UTF-8 for paths, so only test GNU
+    roundtrip_test(&entries, "gnu");
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+fn main() {
+    // Check that Go is available
+    let go_bin = format!("{}/go/bin/go", std::env::var("HOME").unwrap_or_default());
+    if Command::new(&go_bin).arg("version").output().is_err() {
+        eprintln!("Go not found at {go_bin}, skipping");
+        return;
+    }
+
+    println!("=== tar-core <-> Go interop tests ===");
+
+    // Deterministic smoke tests
+    println!("smoke_test_roundtrip...");
+    smoke_test_roundtrip();
+    println!("smoke_test_roundtrip: PASSED");
+
+    println!("smoke_test_pax_long_uname...");
+    smoke_test_pax_long_uname();
+    println!("smoke_test_pax_long_uname: PASSED");
+
+    println!("smoke_test_non_utf8_path...");
+    smoke_test_non_utf8_path();
+    println!("smoke_test_non_utf8_path: PASSED");
+
+    // Arbitrary-driven tests
+    run_random_tests("roundtrip_gnu", 32, |entries| {
+        roundtrip_test(entries, "gnu");
+    });
+
+    run_random_tests("roundtrip_pax", 32, |entries| {
+        // PAX requires UTF-8 paths, so filter to entries with valid UTF-8
+        let utf8_entries: Vec<EntryParams> = entries
+            .iter()
+            .filter(|e| {
+                std::str::from_utf8(&e.path).is_ok()
+                    && std::str::from_utf8(&e.username).is_ok()
+                    && std::str::from_utf8(&e.groupname).is_ok()
+            })
+            .cloned()
+            .collect();
+        if !utf8_entries.is_empty() {
+            roundtrip_test(&utf8_entries, "pax");
+        }
+    });
+
+    println!("All tests passed!");
 }

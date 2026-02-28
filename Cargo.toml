@@ -15,6 +15,7 @@ thiserror = { version = "2.0", default-features = false }
 zerocopy = { version = "0.8.0", default-features = false, features = ["derive", "std"] }
 
 [dev-dependencies]
+arbitrary = { version = "1", features = ["derive"] }
 base64 = "0.22"
 kani-verifier = "0.67"
 proptest = "1"

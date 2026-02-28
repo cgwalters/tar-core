@@ -18,8 +18,9 @@ unit:
 
 # Run cross-language interop tests (requires python3, go)
 interop:
-    cargo test --test interop_python -- --ignored
-    cargo test --test interop_go -- --ignored
+    cargo run --example interop-python
+    cargo run --example interop-go
+    cargo run --example interop-tar
 
 # Run all tests
 test-all: unit interop
