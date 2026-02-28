@@ -53,8 +53,10 @@ use zerocopy::FromBytes;
 
 use crate::{
     EntryType, GnuExtSparseHeader, Header, HeaderError, PaxError, PaxExtensions, SparseEntry,
-    HEADER_SIZE, PAX_GID, PAX_GNAME, PAX_LINKPATH, PAX_MTIME, PAX_PATH, PAX_SCHILY_XATTR, PAX_SIZE,
-    PAX_UID, PAX_UNAME,
+    HEADER_SIZE, PAX_GID, PAX_GNAME, PAX_GNU_SPARSE_MAJOR, PAX_GNU_SPARSE_MAP,
+    PAX_GNU_SPARSE_MINOR, PAX_GNU_SPARSE_NAME, PAX_GNU_SPARSE_NUMBYTES, PAX_GNU_SPARSE_OFFSET,
+    PAX_GNU_SPARSE_REALSIZE, PAX_GNU_SPARSE_SIZE, PAX_LINKPATH, PAX_MTIME, PAX_PATH,
+    PAX_SCHILY_XATTR, PAX_SIZE, PAX_UID, PAX_UNAME,
 };
 
 // ============================================================================
@@ -277,6 +279,10 @@ pub enum ParseError {
     /// Sparse entry type present but header is not GNU format.
     #[error("sparse entry type but header is not GNU format")]
     SparseNotGnu,
+
+    /// A PAX sparse map field is malformed.
+    #[error("invalid PAX sparse map: {0}")]
+    InvalidPaxSparseMap(String),
 
     /// A PAX extension value failed to parse in strict mode.
     #[error("invalid PAX {key} value: {value:?}")]
@@ -759,8 +765,15 @@ impl Parser {
             }
             EntryType::GnuSparse => self.handle_gnu_sparse(input, header, size),
             _ => {
-                // Actual entry - resolve metadata and emit
-                self.emit_entry(header, size, None)
+                // Check for PAX v1.0 sparse before emitting — it requires
+                // reading the sparse map from the data stream.
+                if self.pending_pax_sparse_version()? == Some((1, 0)) {
+                    self.handle_pax_sparse_v1(input, header, size)
+                } else {
+                    // Actual entry — emit_entry handles v0.0/v0.1 PAX sparse
+                    // inline during PAX extension processing.
+                    self.emit_entry(header, size, None)
+                }
             }
         }
     }
@@ -866,6 +879,265 @@ impl Parser {
             self.pending = saved;
         }
         result
+    }
+
+    /// Check pending PAX extensions for GNU sparse version.
+    ///
+    /// Returns `Some((major, minor))` if `GNU.sparse.major` and
+    /// `GNU.sparse.minor` are both present and parseable, `None` if
+    /// the keys are absent. In strict mode, malformed values produce
+    /// errors instead of being silently ignored.
+    fn pending_pax_sparse_version(&self) -> Result<Option<(u64, u64)>> {
+        let pax = match self.pending.pax_extensions.as_ref() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let strict = self.limits.strict;
+        let mut major = None;
+        let mut minor = None;
+        for ext in PaxExtensions::new(pax) {
+            let ext = ext?;
+            let key = match ext.key() {
+                Ok(k) => k,
+                Err(_) if !strict => continue,
+                Err(e) => return Err(ParseError::from(e)),
+            };
+            match key {
+                PAX_GNU_SPARSE_MAJOR => {
+                    let s = match ext.value() {
+                        Ok(s) => s,
+                        Err(_) if !strict => continue,
+                        Err(_) => {
+                            return Err(ParseError::InvalidPaxValue {
+                                key: PAX_GNU_SPARSE_MAJOR,
+                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                            })
+                        }
+                    };
+                    match s.parse::<u64>() {
+                        Ok(v) => major = Some(v),
+                        Err(_) if !strict => {}
+                        Err(_) => {
+                            return Err(ParseError::InvalidPaxValue {
+                                key: PAX_GNU_SPARSE_MAJOR,
+                                value: s.into(),
+                            })
+                        }
+                    }
+                }
+                PAX_GNU_SPARSE_MINOR => {
+                    let s = match ext.value() {
+                        Ok(s) => s,
+                        Err(_) if !strict => continue,
+                        Err(_) => {
+                            return Err(ParseError::InvalidPaxValue {
+                                key: PAX_GNU_SPARSE_MINOR,
+                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                            })
+                        }
+                    };
+                    match s.parse::<u64>() {
+                        Ok(v) => minor = Some(v),
+                        Err(_) if !strict => {}
+                        Err(_) => {
+                            return Err(ParseError::InvalidPaxValue {
+                                key: PAX_GNU_SPARSE_MINOR,
+                                value: s.into(),
+                            })
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if major.is_some() && minor.is_some() {
+                break;
+            }
+        }
+        match (major, minor) {
+            (Some(maj), Some(min)) => Ok(Some((maj, min))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Handle a PAX v1.0 sparse entry.
+    ///
+    /// The sparse map is encoded as newline-delimited decimal values at
+    /// the start of the file's data block:
+    ///
+    /// ```text
+    /// <num_entries>\n
+    /// <offset_0>\n
+    /// <length_0>\n
+    /// ...
+    /// ```
+    ///
+    /// followed by padding to the next 512-byte boundary. This prefix is
+    /// consumed by the parser and not included in the entry's content.
+    fn handle_pax_sparse_v1<'a>(
+        &mut self,
+        input: &'a [u8],
+        header: &'a Header,
+        size: u64,
+    ) -> Result<ParseEvent<'a>> {
+        // Extract sparse metadata from PAX extensions.
+        let pax = self
+            .pending
+            .pax_extensions
+            .as_ref()
+            .ok_or_else(|| ParseError::InvalidPaxSparseMap("missing PAX extensions".into()))?;
+
+        let strict = self.limits.strict;
+        let mut real_size = None;
+        let mut sparse_name = None;
+        for ext in PaxExtensions::new(pax) {
+            let ext = ext?;
+            let key = match ext.key() {
+                Ok(k) => k,
+                Err(_) if !strict => continue,
+                Err(e) => return Err(ParseError::from(e)),
+            };
+            match key {
+                PAX_GNU_SPARSE_REALSIZE | PAX_GNU_SPARSE_SIZE => {
+                    let s = match ext.value() {
+                        Ok(s) => s,
+                        Err(_) if !strict => continue,
+                        Err(_) => {
+                            return Err(ParseError::InvalidPaxValue {
+                                key: PAX_GNU_SPARSE_REALSIZE,
+                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                            })
+                        }
+                    };
+                    match s.parse::<u64>() {
+                        Ok(v) => real_size = Some(v),
+                        Err(_) if !strict => {}
+                        Err(_) => {
+                            return Err(ParseError::InvalidPaxValue {
+                                key: PAX_GNU_SPARSE_REALSIZE,
+                                value: s.into(),
+                            })
+                        }
+                    }
+                }
+                PAX_GNU_SPARSE_NAME => {
+                    sparse_name = Some(ext.value_bytes().to_vec());
+                }
+                _ => {}
+            }
+        }
+
+        let real_size = real_size
+            .ok_or_else(|| ParseError::InvalidPaxSparseMap("missing GNU.sparse.realsize".into()))?;
+
+        // The sparse map data starts right after the header (at offset
+        // HEADER_SIZE within the input). We need to parse it without
+        // knowing its exact size upfront — we read line by line.
+        //
+        // To remain sans-IO, we scan the available input. If we don't
+        // have enough, return NeedData.
+        let data_start = HEADER_SIZE;
+        let data = &input[data_start..];
+
+        // Parse newline-delimited sparse map.
+        let mut pos = 0usize;
+
+        // Helper: read next decimal line from data[pos..]
+        let read_line = |data: &[u8], pos: &mut usize| -> Option<Result<u64>> {
+            let remaining = &data[*pos..];
+            let nl = remaining.iter().position(|&b| b == b'\n')?;
+            let line = &remaining[..nl];
+            *pos += nl + 1;
+            let s = match std::str::from_utf8(line) {
+                Ok(s) => s,
+                Err(_) => {
+                    return Some(Err(ParseError::InvalidPaxSparseMap(
+                        "non-UTF8 in sparse map".into(),
+                    )))
+                }
+            };
+            match s.parse::<u64>() {
+                Ok(v) => Some(Ok(v)),
+                Err(_) => Some(Err(ParseError::InvalidPaxSparseMap(format!(
+                    "invalid decimal: {s:?}"
+                )))),
+            }
+        };
+
+        // Read the entry count.
+        let num_entries = match read_line(data, &mut pos) {
+            Some(r) => r?,
+            None => {
+                // Need more data — we need at least enough to see the
+                // first newline. Request a generous amount.
+                return Ok(ParseEvent::NeedData {
+                    min_bytes: data_start + pos + HEADER_SIZE,
+                });
+            }
+        };
+
+        if num_entries as usize > self.limits.max_sparse_entries {
+            return Err(ParseError::TooManySparseEntries {
+                count: num_entries as usize,
+                limit: self.limits.max_sparse_entries,
+            });
+        }
+
+        let mut sparse_map = Vec::with_capacity(num_entries as usize);
+        for _ in 0..num_entries {
+            let offset = match read_line(data, &mut pos) {
+                Some(r) => r?,
+                None => {
+                    return Ok(ParseEvent::NeedData {
+                        min_bytes: data_start + pos + HEADER_SIZE,
+                    });
+                }
+            };
+            let length = match read_line(data, &mut pos) {
+                Some(r) => r?,
+                None => {
+                    return Ok(ParseEvent::NeedData {
+                        min_bytes: data_start + pos + HEADER_SIZE,
+                    });
+                }
+            };
+            sparse_map.push(SparseEntry { offset, length });
+        }
+
+        // The sparse map data is padded to a 512-byte boundary.
+        let map_size = pos.next_multiple_of(HEADER_SIZE);
+
+        // Verify we have enough input for the padded map.
+        if data.len() < map_size {
+            return Ok(ParseEvent::NeedData {
+                min_bytes: data_start + map_size,
+            });
+        }
+
+        // The remaining content size is the original size minus the
+        // sparse map prefix (including padding).
+        let content_size = size.checked_sub(map_size as u64).ok_or_else(|| {
+            ParseError::InvalidPaxSparseMap("sparse map prefix larger than entry size".into())
+        })?;
+
+        let sparse_ctx = SparseContext {
+            sparse_map,
+            real_size,
+            // Extension consumed = the sparse map data prefix.
+            ext_consumed: map_size,
+        };
+
+        // Override the path with GNU.sparse.name if present.
+        if let Some(name) = sparse_name {
+            // Stash in pending so emit_entry picks it up. We don't use
+            // gnu_long_name because that has different semantics (no
+            // trailing NUL). Instead we'll handle it after emit_entry
+            // returns, or we can pass it through the sparse context.
+            // Actually, the cleanest way: temporarily store it in
+            // gnu_long_name so emit_entry applies it.
+            self.pending.gnu_long_name = Some(name);
+        }
+
+        self.emit_entry(header, content_size, Some(sparse_ctx))
     }
 
     /// Handle a GNU sparse entry (type 'S').
@@ -997,6 +1269,15 @@ impl Parser {
 
         // Apply PAX extensions (highest priority)
         let raw_pax = self.pending.pax_extensions.take();
+
+        // PAX sparse v0.0/v0.1 tracking. v0.0 uses repeated offset/numbytes
+        // pairs; v0.1 uses a single comma-separated map string.
+        let mut pax_sparse_map: Option<Vec<SparseEntry>> = None;
+        let mut pax_sparse_real_size: Option<u64> = None;
+        let mut pax_sparse_name: Option<Vec<u8>> = None;
+        // v0.0: current offset waiting for its numbytes pair
+        let mut pax_sparse_pending_offset: Option<u64> = None;
+
         if let Some(ref pax) = raw_pax {
             let strict = self.limits.strict;
             let extensions = PaxExtensions::new(pax);
@@ -1095,6 +1376,90 @@ impl Parser {
                     PAX_GNAME => {
                         gname = Some(Cow::Owned(value.to_vec()));
                     }
+
+                    // PAX sparse v0.0: repeated offset/numbytes pairs
+                    PAX_GNU_SPARSE_OFFSET => {
+                        let v = parse_pax_u64(&ext, PAX_GNU_SPARSE_OFFSET)?;
+                        pax_sparse_pending_offset = v;
+                    }
+                    PAX_GNU_SPARSE_NUMBYTES => {
+                        if let (Some(offset), Some(length)) = (
+                            pax_sparse_pending_offset.take(),
+                            parse_pax_u64(&ext, PAX_GNU_SPARSE_NUMBYTES)?,
+                        ) {
+                            let map = pax_sparse_map.get_or_insert_with(Vec::new);
+                            if map.len() >= self.limits.max_sparse_entries {
+                                return Err(ParseError::TooManySparseEntries {
+                                    count: map.len() + 1,
+                                    limit: self.limits.max_sparse_entries,
+                                });
+                            }
+                            map.push(SparseEntry { offset, length });
+                        }
+                    }
+
+                    // PAX sparse v0.1: comma-separated map
+                    PAX_GNU_SPARSE_MAP => {
+                        let s = match ext.value() {
+                            Ok(s) => s,
+                            Err(_) if !strict => continue,
+                            Err(_) => {
+                                return Err(ParseError::InvalidPaxSparseMap(
+                                    "non-UTF8 sparse map".into(),
+                                ))
+                            }
+                        };
+                        let mut map = Vec::new();
+                        let parts: Vec<&str> = s.split(',').filter(|p| !p.is_empty()).collect();
+                        if parts.len() % 2 != 0 {
+                            return Err(ParseError::InvalidPaxSparseMap(
+                                "odd number of values in GNU.sparse.map".into(),
+                            ));
+                        }
+                        for pair in parts.chunks(2) {
+                            if map.len() >= self.limits.max_sparse_entries {
+                                return Err(ParseError::TooManySparseEntries {
+                                    count: map.len() + 1,
+                                    limit: self.limits.max_sparse_entries,
+                                });
+                            }
+                            let offset = pair[0].parse::<u64>().map_err(|_| {
+                                ParseError::InvalidPaxSparseMap(format!(
+                                    "invalid offset: {:?}",
+                                    pair[0]
+                                ))
+                            })?;
+                            let length = pair[1].parse::<u64>().map_err(|_| {
+                                ParseError::InvalidPaxSparseMap(format!(
+                                    "invalid length: {:?}",
+                                    pair[1]
+                                ))
+                            })?;
+                            map.push(SparseEntry { offset, length });
+                        }
+                        pax_sparse_map = Some(map);
+                    }
+
+                    // PAX sparse: real size and name (shared across versions)
+                    PAX_GNU_SPARSE_REALSIZE | PAX_GNU_SPARSE_SIZE => {
+                        if let Some(v) = parse_pax_u64(&ext, PAX_GNU_SPARSE_REALSIZE)? {
+                            pax_sparse_real_size = Some(v);
+                        }
+                    }
+                    PAX_GNU_SPARSE_NAME => {
+                        if value.len() > self.limits.max_path_len {
+                            return Err(ParseError::PathTooLong {
+                                len: value.len(),
+                                limit: self.limits.max_path_len,
+                            });
+                        }
+                        pax_sparse_name = Some(value.to_vec());
+                    }
+
+                    // Skip version fields — already handled in
+                    // pending_pax_sparse_version() for v1.0 routing.
+                    PAX_GNU_SPARSE_MAJOR | PAX_GNU_SPARSE_MINOR => {}
+
                     _ => {
                         if let Some(attr_name) = key.strip_prefix(PAX_SCHILY_XATTR) {
                             xattrs.push((
@@ -1105,6 +1470,11 @@ impl Parser {
                     }
                 }
             }
+        }
+
+        // Apply PAX sparse name override (highest priority for path).
+        if let Some(name) = pax_sparse_name {
+            path = Cow::Owned(name);
         }
 
         // Clear pending metadata
@@ -1140,6 +1510,17 @@ impl Parser {
             xattrs,
             pax: raw_pax,
         };
+
+        // Determine the sparse context. Priority:
+        // 1. Explicit sparse context (from GNU sparse type 'S' or PAX v1.0)
+        // 2. PAX sparse v0.0/v0.1 data collected during PAX processing
+        let sparse = sparse.or_else(|| {
+            pax_sparse_map.map(|map| SparseContext {
+                sparse_map: map,
+                real_size: pax_sparse_real_size.unwrap_or(entry_size),
+                ext_consumed: 0, // PAX v0.0/v0.1 has no extra blocks
+            })
+        });
 
         if let Some(ctx) = sparse {
             // Consume the main header plus any extension blocks.
@@ -2796,6 +3177,293 @@ mod tests {
     }
 
     // =========================================================================
+    // PAX sparse tests
+    // =========================================================================
+
+    #[test]
+    fn test_pax_sparse_v01_map() {
+        // PAX v0.1: GNU.sparse.map as comma-separated offset,length pairs
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[
+            ("GNU.sparse.map", b"0,100,200,100,400,50"),
+            ("GNU.sparse.realsize", b"450"),
+            ("GNU.sparse.name", b"real_name.txt"),
+        ]));
+        // The actual file header — 250 bytes of on-disk data
+        archive.extend_from_slice(&make_header(b"placeholder.txt", 250, b'0'));
+        archive.extend(zeroes(512)); // content (250 bytes padded)
+        archive.extend(zeroes(1024)); // end of archive
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                entry,
+                sparse_map,
+                real_size,
+                ..
+            } => {
+                assert_eq!(entry.path.as_ref(), b"real_name.txt");
+                assert_eq!(real_size, 450);
+                assert_eq!(sparse_map.len(), 3);
+                assert_eq!(
+                    sparse_map[0],
+                    SparseEntry {
+                        offset: 0,
+                        length: 100
+                    }
+                );
+                assert_eq!(
+                    sparse_map[1],
+                    SparseEntry {
+                        offset: 200,
+                        length: 100
+                    }
+                );
+                assert_eq!(
+                    sparse_map[2],
+                    SparseEntry {
+                        offset: 400,
+                        length: 50
+                    }
+                );
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pax_sparse_v00_pairs() {
+        // PAX v0.0: repeated GNU.sparse.offset / GNU.sparse.numbytes pairs
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[
+            ("GNU.sparse.offset", b"0"),
+            ("GNU.sparse.numbytes", b"100"),
+            ("GNU.sparse.offset", b"1024"),
+            ("GNU.sparse.numbytes", b"200"),
+            ("GNU.sparse.realsize", b"1224"),
+            ("GNU.sparse.name", b"v00_sparse.dat"),
+        ]));
+        archive.extend_from_slice(&make_header(b"placeholder", 300, b'0'));
+        archive.extend(zeroes(512)); // content
+        archive.extend(zeroes(1024)); // end
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                entry,
+                sparse_map,
+                real_size,
+                ..
+            } => {
+                assert_eq!(entry.path.as_ref(), b"v00_sparse.dat");
+                assert_eq!(real_size, 1224);
+                assert_eq!(sparse_map.len(), 2);
+                assert_eq!(
+                    sparse_map[0],
+                    SparseEntry {
+                        offset: 0,
+                        length: 100
+                    }
+                );
+                assert_eq!(
+                    sparse_map[1],
+                    SparseEntry {
+                        offset: 1024,
+                        length: 200
+                    }
+                );
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pax_sparse_v10_data_prefix() {
+        // PAX v1.0: sparse map in data block prefix
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[
+            ("GNU.sparse.major", b"1"),
+            ("GNU.sparse.minor", b"0"),
+            ("GNU.sparse.realsize", b"2048"),
+            ("GNU.sparse.name", b"v10_sparse.bin"),
+        ]));
+
+        // The data block prefix contains the sparse map:
+        // "2\n0\n100\n1024\n200\n" = 20 bytes, padded to 512
+        let sparse_data = b"2\n0\n100\n1024\n200\n";
+        let on_disk_content = 300u64; // actual data bytes after the map
+        let total_size = 512 + on_disk_content; // map prefix (padded) + content
+
+        archive.extend_from_slice(&make_header(b"placeholder", total_size, b'0'));
+        // Data: sparse map prefix (padded to 512) + actual content
+        let mut data_block = vec![0u8; 512];
+        data_block[..sparse_data.len()].copy_from_slice(sparse_data);
+        archive.extend_from_slice(&data_block);
+        archive.extend(zeroes(on_disk_content.next_multiple_of(512) as usize));
+        archive.extend(zeroes(1024)); // end
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                consumed,
+                entry,
+                sparse_map,
+                real_size,
+            } => {
+                assert_eq!(entry.path.as_ref(), b"v10_sparse.bin");
+                assert_eq!(real_size, 2048);
+                assert_eq!(sparse_map.len(), 2);
+                assert_eq!(
+                    sparse_map[0],
+                    SparseEntry {
+                        offset: 0,
+                        length: 100
+                    }
+                );
+                assert_eq!(
+                    sparse_map[1],
+                    SparseEntry {
+                        offset: 1024,
+                        length: 200
+                    }
+                );
+                // entry.size is the on-disk content after the map prefix
+                assert_eq!(entry.size, on_disk_content);
+                // consumed includes: PAX header + its content + actual header
+                // + sparse map prefix (512 bytes)
+                let pax_hdr_size = archive.len()
+                    - HEADER_SIZE // actual file header
+                    - 512 // sparse map data
+                    - on_disk_content.next_multiple_of(512) as usize
+                    - 1024; // end
+                let expected_consumed = pax_hdr_size + HEADER_SIZE + 512;
+                assert_eq!(consumed, expected_consumed);
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pax_sparse_v10_need_data() {
+        // PAX v1.0 with insufficient data for the sparse map prefix.
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[
+            ("GNU.sparse.major", b"1"),
+            ("GNU.sparse.minor", b"0"),
+            ("GNU.sparse.realsize", b"100"),
+            ("GNU.sparse.name", b"v10_need.txt"),
+        ]));
+
+        // Provide the actual file header but NOT the data block.
+        archive.extend_from_slice(&make_header(b"placeholder", 512, b'0'));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        assert!(
+            matches!(event, ParseEvent::NeedData { .. }),
+            "Expected NeedData, got {event:?}"
+        );
+    }
+
+    #[test]
+    fn test_pax_sparse_v01_odd_map_values() {
+        // GNU.sparse.map with odd number of values is an error
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[
+            ("GNU.sparse.map", b"0,100,200"),
+            ("GNU.sparse.realsize", b"300"),
+        ]));
+        archive.extend_from_slice(&make_header(b"file.txt", 100, b'0'));
+        archive.extend(zeroes(512));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let err = parser.parse(&archive).unwrap_err();
+        assert!(matches!(err, ParseError::InvalidPaxSparseMap(_)));
+    }
+
+    #[test]
+    fn test_pax_sparse_v10_too_many_entries() {
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[
+            ("GNU.sparse.major", b"1"),
+            ("GNU.sparse.minor", b"0"),
+            ("GNU.sparse.realsize", b"100"),
+            ("GNU.sparse.name", b"toomany.txt"),
+        ]));
+
+        // Sparse map claims 1000 entries
+        let sparse_data = b"1000\n";
+        let total_size = 512u64;
+        archive.extend_from_slice(&make_header(b"placeholder", total_size, b'0'));
+        let mut data_block = vec![0u8; 512];
+        data_block[..sparse_data.len()].copy_from_slice(sparse_data);
+        archive.extend_from_slice(&data_block);
+        archive.extend(zeroes(1024));
+
+        let limits = Limits {
+            max_sparse_entries: 100,
+            ..Default::default()
+        };
+        let mut parser = Parser::new(limits);
+        let err = parser.parse(&archive).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ParseError::TooManySparseEntries {
+                    count: 1000,
+                    limit: 100
+                }
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_pax_sparse_without_version_is_v00() {
+        // PAX sparse data without version fields should be treated as v0.0
+        // (offset/numbytes pairs), not routed to v1.0 handler.
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[
+            ("GNU.sparse.offset", b"0"),
+            ("GNU.sparse.numbytes", b"50"),
+            ("GNU.sparse.realsize", b"50"),
+        ]));
+        archive.extend_from_slice(&make_header(b"noversion.txt", 50, b'0'));
+        archive.extend(zeroes(512)); // content
+        archive.extend(zeroes(1024)); // end
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                sparse_map,
+                real_size,
+                ..
+            } => {
+                assert_eq!(sparse_map.len(), 1);
+                assert_eq!(
+                    sparse_map[0],
+                    SparseEntry {
+                        offset: 0,
+                        length: 50
+                    }
+                );
+                assert_eq!(real_size, 50);
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
     // Sparse proptests
     // =========================================================================
 
@@ -2974,6 +3642,162 @@ mod tests {
                 match event {
                     ParseEvent::SparseEntry { sparse_map, .. } => {
                         prop_assert_eq!(sparse_map.len(), total);
+                    }
+                    other => {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            format!("Expected SparseEntry, got {other:?}")));
+                    }
+                }
+            }
+
+            // =================================================================
+            // PAX sparse format proptests
+            // =================================================================
+
+            #[test]
+            fn test_pax_sparse_v00_roundtrip(
+                entries in sparse_map_strategy(15),
+                name_len in 1usize..50,
+            ) {
+                let name: Vec<u8> = (0..name_len).map(|i| b'a' + (i % 26) as u8).collect();
+                let on_disk: u64 = entries.iter().map(|(_, l)| l).sum();
+                let real_size = entries.last().map(|(o, l)| o + l).unwrap_or(0);
+
+                let mut pax_kv: Vec<(&str, Vec<u8>)> = Vec::new();
+                for &(offset, length) in &entries {
+                    pax_kv.push(("GNU.sparse.offset", offset.to_string().into_bytes()));
+                    pax_kv.push(("GNU.sparse.numbytes", length.to_string().into_bytes()));
+                }
+                pax_kv.push(("GNU.sparse.realsize", real_size.to_string().into_bytes()));
+                pax_kv.push(("GNU.sparse.name", name.clone()));
+
+                let pax_refs: Vec<(&str, &[u8])> =
+                    pax_kv.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+
+                let mut archive = Vec::new();
+                archive.extend(make_pax_header(&pax_refs));
+                archive.extend_from_slice(&make_header(b"placeholder", on_disk, b'0'));
+                archive.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+                archive.extend(zeroes(1024));
+
+                let mut parser = Parser::new(Limits::default());
+                let event = parser.parse(&archive).unwrap();
+
+                match event {
+                    ParseEvent::SparseEntry { sparse_map, real_size: rs, entry, .. } => {
+                        prop_assert_eq!(&entry.path[..], &name[..]);
+                        prop_assert_eq!(rs, real_size);
+                        prop_assert_eq!(sparse_map.len(), entries.len());
+                        for (i, &(off, len)) in entries.iter().enumerate() {
+                            prop_assert_eq!(sparse_map[i].offset, off);
+                            prop_assert_eq!(sparse_map[i].length, len);
+                        }
+                    }
+                    ParseEvent::Entry { .. } if entries.is_empty() => {}
+                    other => {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            format!("Expected SparseEntry, got {other:?}")));
+                    }
+                }
+            }
+
+            #[test]
+            fn test_pax_sparse_v01_roundtrip(
+                entries in sparse_map_strategy(15),
+                name_len in 1usize..50,
+            ) {
+                let name: Vec<u8> = (0..name_len).map(|i| b'a' + (i % 26) as u8).collect();
+                let on_disk: u64 = entries.iter().map(|(_, l)| l).sum();
+                let real_size = entries.last().map(|(o, l)| o + l).unwrap_or(0);
+
+                let map_str: String = entries
+                    .iter()
+                    .flat_map(|(o, l)| [o.to_string(), l.to_string()])
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let map_bytes = map_str.into_bytes();
+                let rs_bytes = real_size.to_string().into_bytes();
+
+                let pax_refs: Vec<(&str, &[u8])> = vec![
+                    ("GNU.sparse.map", &map_bytes),
+                    ("GNU.sparse.realsize", &rs_bytes),
+                    ("GNU.sparse.name", &name),
+                ];
+
+                let mut archive = Vec::new();
+                archive.extend(make_pax_header(&pax_refs));
+                archive.extend_from_slice(&make_header(b"placeholder", on_disk, b'0'));
+                archive.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+                archive.extend(zeroes(1024));
+
+                let mut parser = Parser::new(Limits::default());
+                let event = parser.parse(&archive).unwrap();
+
+                match event {
+                    ParseEvent::SparseEntry { sparse_map, real_size: rs, entry, .. } => {
+                        prop_assert_eq!(&entry.path[..], &name[..]);
+                        prop_assert_eq!(rs, real_size);
+                        prop_assert_eq!(sparse_map.len(), entries.len());
+                        for (i, &(off, len)) in entries.iter().enumerate() {
+                            prop_assert_eq!(sparse_map[i].offset, off);
+                            prop_assert_eq!(sparse_map[i].length, len);
+                        }
+                    }
+                    ParseEvent::Entry { .. } if entries.is_empty() => {}
+                    other => {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            format!("Expected SparseEntry, got {other:?}")));
+                    }
+                }
+            }
+
+            #[test]
+            fn test_pax_sparse_v10_roundtrip(
+                entries in sparse_map_strategy(20),
+                name_len in 1usize..50,
+            ) {
+                let name: Vec<u8> = (0..name_len).map(|i| b'a' + (i % 26) as u8).collect();
+                let on_disk: u64 = entries.iter().map(|(_, l)| l).sum();
+                let real_size = entries.last().map(|(o, l)| o + l).unwrap_or(0);
+
+                let mut map_data = format!("{}\n", entries.len());
+                for &(offset, length) in &entries {
+                    map_data.push_str(&format!("{offset}\n{length}\n"));
+                }
+                let map_bytes = map_data.into_bytes();
+                let map_padded = map_bytes.len().next_multiple_of(HEADER_SIZE);
+                let total_size = map_padded as u64 + on_disk;
+                let rs_bytes = real_size.to_string().into_bytes();
+
+                let pax_refs: Vec<(&str, &[u8])> = vec![
+                    ("GNU.sparse.major", b"1"),
+                    ("GNU.sparse.minor", b"0"),
+                    ("GNU.sparse.realsize", &rs_bytes),
+                    ("GNU.sparse.name", &name),
+                ];
+
+                let mut archive = Vec::new();
+                archive.extend(make_pax_header(&pax_refs));
+                archive.extend_from_slice(&make_header(b"placeholder", total_size, b'0'));
+                let mut data_block = vec![0u8; map_padded];
+                data_block[..map_bytes.len()].copy_from_slice(&map_bytes);
+                archive.extend_from_slice(&data_block);
+                archive.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+                archive.extend(zeroes(1024));
+
+                let mut parser = Parser::new(Limits::default());
+                let event = parser.parse(&archive).unwrap();
+
+                match event {
+                    ParseEvent::SparseEntry { sparse_map, real_size: rs, entry, .. } => {
+                        prop_assert_eq!(&entry.path[..], &name[..]);
+                        prop_assert_eq!(rs, real_size);
+                        prop_assert_eq!(entry.size, on_disk);
+                        prop_assert_eq!(sparse_map.len(), entries.len());
+                        for (i, &(off, len)) in entries.iter().enumerate() {
+                            prop_assert_eq!(sparse_map[i].offset, off);
+                            prop_assert_eq!(sparse_map[i].length, len);
+                        }
                     }
                     other => {
                         return Err(proptest::test_runner::TestCaseError::fail(
