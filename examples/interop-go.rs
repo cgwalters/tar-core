@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use tar_core::builder::EntryBuilder;
-use tar_core::parse::{Limits, ParseEvent, Parser};
+use tar_core::parse::{Limits, ParseEvent, Parsed, Parser};
 use tar_core::{EntryType, HEADER_SIZE};
 
 // ============================================================================
@@ -437,11 +437,12 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
 
     loop {
         let input = &data[offset..];
-        match parser.parse(input).expect("parse should succeed") {
+        let Parsed { consumed, event } = parser.parse(input).expect("parse should succeed");
+        match event {
             ParseEvent::NeedData { .. } => {
                 panic!("unexpected NeedData — archive should be complete in memory");
             }
-            ParseEvent::Entry { consumed, entry } => {
+            ParseEvent::Entry(entry) => {
                 offset += consumed;
 
                 let path = entry.path.to_vec();
@@ -472,7 +473,7 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
                     content,
                 });
             }
-            ParseEvent::End { consumed } => {
+            ParseEvent::End => {
                 offset += consumed;
                 let _ = offset;
                 break;

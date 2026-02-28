@@ -25,7 +25,7 @@
 //! # Example
 //!
 //! ```
-//! use tar_core::parse::{Parser, ParseEvent, Limits};
+//! use tar_core::parse::{Parser, ParseEvent, Parsed, Limits};
 //!
 //! let mut parser = Parser::new(Limits::default());
 //!
@@ -33,11 +33,11 @@
 //! let data = [0u8; 1024]; // Two zero blocks = end of archive
 //!
 //! match parser.parse(&data) {
-//!     Ok(ParseEvent::End { consumed }) => {
+//!     Ok(Parsed { consumed, event: ParseEvent::End }) => {
 //!         println!("End of archive after {} bytes", consumed);
 //!     }
-//!     Ok(event) => {
-//!         println!("Got event {:?}", event);
+//!     Ok(parsed) => {
+//!         println!("Got event {:?} (consumed {} bytes)", parsed.event, parsed.consumed);
 //!     }
 //!     Err(e) => {
 //!         eprintln!("Parse error: {}", e);
@@ -67,17 +67,24 @@ use crate::{
 /// # Example
 ///
 /// ```
-/// use tar_core::parse::Limits;
+/// use tar_core::parse::{Parser, ParseEvent, Parsed, Limits};
 ///
-/// // Use defaults
-/// let limits = Limits::default();
+/// let mut parser = Parser::new(Limits::default());
 ///
-/// // Customize limits
-/// let strict_limits = Limits {
-///     max_path_len: 1024,
-///     max_pax_size: 64 * 1024,
-///     ..Default::default()
-/// };
+/// // Simulated tar data (in practice, read from file/network)
+/// let data = [0u8; 1024]; // Two zero blocks = end of archive
+///
+/// match parser.parse(&data) {
+///     Ok(Parsed { consumed, event: ParseEvent::End }) => {
+///         println!("End of archive after {} bytes", consumed);
+///     }
+///     Ok(parsed) => {
+///         println!("Got event {:?} (consumed {} bytes)", parsed.event, parsed.consumed);
+///     }
+///     Err(e) => {
+///         eprintln!("Parse error: {}", e);
+///     }
+/// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
@@ -298,37 +305,37 @@ pub enum ParseEvent<'a> {
     /// 1. Read/skip `entry.size` bytes of content from the input
     /// 2. Read/skip padding bytes to reach the next 512-byte boundary
     /// 3. Call `advance_content(entry.size)` to update parser state
-    Entry {
-        /// Number of bytes consumed from the input for this entry's header(s).
-        consumed: usize,
-        /// The parsed entry with resolved metadata.
-        entry: ParsedEntry<'a>,
-    },
+    Entry(ParsedEntry<'a>),
 
     /// Archive end marker reached (two consecutive zero blocks, or clean EOF).
-    End {
-        /// Number of bytes consumed from the input.
-        consumed: usize,
-    },
+    End,
 }
 
-impl<'a> ParseEvent<'a> {
-    /// Add `n` to the consumed byte count in this event.
+/// Result of a single [`Parser::parse`] call.
+///
+/// Wraps a [`ParseEvent`] together with the number of bytes consumed from
+/// the input buffer. The caller should advance past `consumed` bytes before
+/// the next call. For `NeedData` events, `consumed` is always 0.
+#[derive(Debug)]
+pub struct Parsed<'a> {
+    /// Number of bytes consumed from the input.
+    pub consumed: usize,
+    /// The parse event.
+    pub event: ParseEvent<'a>,
+}
+
+impl<'a> Parsed<'a> {
+    /// Add `n` to the consumed byte count.
     ///
     /// Used when recursing through extension headers to accumulate the total
-    /// bytes consumed. `NeedData` is unchanged because no bytes are committed
-    /// when the parser needs more input (it will re-parse from the start).
-    fn add_consumed(self, n: usize) -> Self {
-        match self {
-            ev @ ParseEvent::NeedData { .. } => ev,
-            ParseEvent::Entry { consumed, entry } => ParseEvent::Entry {
-                consumed: consumed + n,
-                entry,
-            },
-            ParseEvent::End { consumed } => ParseEvent::End {
-                consumed: consumed + n,
-            },
+    /// bytes consumed. `NeedData` events are unchanged because no bytes are
+    /// committed when the parser needs more input (it will re-parse from the
+    /// start).
+    fn add_consumed(mut self, n: usize) -> Self {
+        if !matches!(self.event, ParseEvent::NeedData { .. }) {
+            self.consumed += n;
         }
+        self
     }
 }
 
@@ -492,7 +499,7 @@ impl PendingMetadata {
 /// loop {
 ///     // Try to parse from current buffer
 ///     match parser.parse(&buf[..filled]) {
-///         Ok(ParseEvent::NeedData { min_bytes }) => {
+///         Ok(Parsed { event: ParseEvent::NeedData { min_bytes }, .. }) => {
 ///             // Need more data - read into buffer
 ///             let n = read_more(&mut buf[filled..])?;
 ///             filled += n;
@@ -500,13 +507,13 @@ impl PendingMetadata {
 ///                 return Err("unexpected EOF");
 ///             }
 ///         }
-///         Ok(ParseEvent::Entry { consumed, entry }) => {
+///         Ok(Parsed { consumed, event: ParseEvent::Entry(entry) }) => {
 ///             process_entry(&entry);
 ///             let content_size = entry.size;
 ///             // ... handle content ...
 ///             parser.advance_content(content_size)?;
 ///         }
-///         Ok(ParseEvent::End { .. }) => break,
+///         Ok(Parsed { event: ParseEvent::End, .. }) => break,
 ///         Err(e) => return Err(e),
 ///     }
 /// }
@@ -552,15 +559,15 @@ impl Parser {
 
     /// Parse the next event from the input buffer.
     ///
-    /// Returns a [`ParseEvent`] on success. `Entry` and `End` events include
-    /// a `consumed` field indicating how many bytes were consumed from the
-    /// input; the caller should advance past that many bytes in their buffer.
+    /// Returns a [`Parsed`] on success, containing the [`ParseEvent`] and the
+    /// number of bytes consumed from the input. The caller should advance past
+    /// `consumed` bytes in their buffer.
     ///
     /// # Events
     ///
-    /// - `NeedData { min_bytes }`: Need at least `min_bytes` more data (nothing consumed)
-    /// - `Entry { consumed, entry }`: A complete entry header; caller must handle content
-    /// - `End { consumed }`: Archive is complete
+    /// - `NeedData { min_bytes }`: Need at least `min_bytes` more data (consumed = 0)
+    /// - `Entry(entry)`: A complete entry header; caller must handle content
+    /// - `End`: Archive is complete
     ///
     /// # Content Handling
     ///
@@ -571,15 +578,21 @@ impl Parser {
     ///
     /// The content bytes are NOT consumed by this method - they remain in
     /// the caller's buffer for processing.
-    pub fn parse<'a>(&mut self, input: &'a [u8]) -> Result<ParseEvent<'a>> {
+    pub fn parse<'a>(&mut self, input: &'a [u8]) -> Result<Parsed<'a>> {
         match self.state {
-            State::Done => Ok(ParseEvent::End { consumed: 0 }),
+            State::Done => Ok(Parsed {
+                consumed: 0,
+                event: ParseEvent::End,
+            }),
 
             State::ReadContent { padded_size } => {
                 // Caller hasn't called advance_content yet
                 // Return NeedData with the remaining content size
-                Ok(ParseEvent::NeedData {
-                    min_bytes: padded_size as usize,
+                Ok(Parsed {
+                    consumed: 0,
+                    event: ParseEvent::NeedData {
+                        min_bytes: padded_size as usize,
+                    },
                 })
             }
 
@@ -625,11 +638,14 @@ impl Parser {
     }
 
     /// Parse a header from the input.
-    fn parse_header<'a>(&mut self, input: &'a [u8]) -> Result<ParseEvent<'a>> {
+    fn parse_header<'a>(&mut self, input: &'a [u8]) -> Result<Parsed<'a>> {
         // Need at least one header block
         if input.len() < HEADER_SIZE {
-            return Ok(ParseEvent::NeedData {
-                min_bytes: HEADER_SIZE,
+            return Ok(Parsed {
+                consumed: 0,
+                event: ParseEvent::NeedData {
+                    min_bytes: HEADER_SIZE,
+                },
             });
         }
 
@@ -644,14 +660,18 @@ impl Parser {
                 if !self.pending.is_empty() {
                     return Err(ParseError::OrphanedMetadata);
                 }
-                return Ok(ParseEvent::End {
+                return Ok(Parsed {
                     consumed: HEADER_SIZE,
+                    event: ParseEvent::End,
                 });
             }
             // First zero block - need to check for second
             if input.len() < 2 * HEADER_SIZE {
-                return Ok(ParseEvent::NeedData {
-                    min_bytes: 2 * HEADER_SIZE,
+                return Ok(Parsed {
+                    consumed: 0,
+                    event: ParseEvent::NeedData {
+                        min_bytes: 2 * HEADER_SIZE,
+                    },
                 });
             }
             // Check second block
@@ -661,8 +681,9 @@ impl Parser {
                 if !self.pending.is_empty() {
                     return Err(ParseError::OrphanedMetadata);
                 }
-                return Ok(ParseEvent::End {
+                return Ok(Parsed {
                     consumed: 2 * HEADER_SIZE,
+                    event: ParseEvent::End,
                 });
             }
             // Not end of archive - continue with second block as header
@@ -702,8 +723,11 @@ impl Parser {
                 // Skip global PAX headers
                 let total_size = HEADER_SIZE as u64 + padded_size;
                 if (input.len() as u64) < total_size {
-                    return Ok(ParseEvent::NeedData {
-                        min_bytes: total_size as usize,
+                    return Ok(Parsed {
+                        consumed: 0,
+                        event: ParseEvent::NeedData {
+                            min_bytes: total_size as usize,
+                        },
                     });
                 }
                 // Recurse to parse next header
@@ -722,7 +746,7 @@ impl Parser {
         input: &'a [u8],
         size: u64,
         padded_size: u64,
-    ) -> Result<ParseEvent<'a>> {
+    ) -> Result<Parsed<'a>> {
         // Check for duplicate
         if self.pending.gnu_long_name.is_some() {
             return Err(ParseError::DuplicateGnuLongName);
@@ -738,8 +762,11 @@ impl Parser {
 
         let total_size = HEADER_SIZE as u64 + padded_size;
         if (input.len() as u64) < total_size {
-            return Ok(ParseEvent::NeedData {
-                min_bytes: total_size as usize,
+            return Ok(Parsed {
+                consumed: 0,
+                event: ParseEvent::NeedData {
+                    min_bytes: total_size as usize,
+                },
             });
         }
 
@@ -766,7 +793,7 @@ impl Parser {
 
         // Recurse to parse next header
         self.parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize))
+            .map(|p| p.add_consumed(total_size as usize))
     }
 
     fn handle_gnu_long_link<'a>(
@@ -774,7 +801,7 @@ impl Parser {
         input: &'a [u8],
         size: u64,
         padded_size: u64,
-    ) -> Result<ParseEvent<'a>> {
+    ) -> Result<Parsed<'a>> {
         // Check for duplicate
         if self.pending.gnu_long_link.is_some() {
             return Err(ParseError::DuplicateGnuLongLink);
@@ -790,8 +817,11 @@ impl Parser {
 
         let total_size = HEADER_SIZE as u64 + padded_size;
         if (input.len() as u64) < total_size {
-            return Ok(ParseEvent::NeedData {
-                min_bytes: total_size as usize,
+            return Ok(Parsed {
+                consumed: 0,
+                event: ParseEvent::NeedData {
+                    min_bytes: total_size as usize,
+                },
             });
         }
 
@@ -818,7 +848,7 @@ impl Parser {
 
         // Recurse to parse next header
         self.parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize))
+            .map(|p| p.add_consumed(total_size as usize))
     }
 
     fn handle_pax_header<'a>(
@@ -826,7 +856,7 @@ impl Parser {
         input: &'a [u8],
         size: u64,
         padded_size: u64,
-    ) -> Result<ParseEvent<'a>> {
+    ) -> Result<Parsed<'a>> {
         // Check for duplicate
         if self.pending.pax_extensions.is_some() {
             return Err(ParseError::DuplicatePaxHeader);
@@ -842,8 +872,11 @@ impl Parser {
 
         let total_size = HEADER_SIZE as u64 + padded_size;
         if (input.len() as u64) < total_size {
-            return Ok(ParseEvent::NeedData {
-                min_bytes: total_size as usize,
+            return Ok(Parsed {
+                consumed: 0,
+                event: ParseEvent::NeedData {
+                    min_bytes: total_size as usize,
+                },
             });
         }
 
@@ -857,10 +890,10 @@ impl Parser {
 
         // Recurse to parse next header
         self.parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize))
+            .map(|p| p.add_consumed(total_size as usize))
     }
 
-    fn emit_entry<'a>(&mut self, header: &'a Header, size: u64) -> Result<ParseEvent<'a>> {
+    fn emit_entry<'a>(&mut self, header: &'a Header, size: u64) -> Result<Parsed<'a>> {
         // Start with header values
         let mut path: Cow<'a, [u8]> = Cow::Borrowed(header.path_bytes());
         let mut link_target: Option<Cow<'a, [u8]>> = None;
@@ -1043,9 +1076,9 @@ impl Parser {
         };
 
         // Only consume the header - content is left for caller
-        Ok(ParseEvent::Entry {
+        Ok(Parsed {
             consumed: HEADER_SIZE,
-            entry,
+            event: ParseEvent::Entry(entry),
         })
     }
 }
@@ -1086,7 +1119,13 @@ mod tests {
         let data = [0u8; 1024];
 
         let event = parser.parse(&data).unwrap();
-        assert!(matches!(event, ParseEvent::End { consumed: 1024 }));
+        assert!(matches!(
+            event,
+            Parsed {
+                consumed: 1024,
+                event: ParseEvent::End
+            }
+        ));
         assert!(parser.is_done());
     }
 
@@ -1098,7 +1137,10 @@ mod tests {
         let data = [0u8; 256];
 
         let event = parser.parse(&data).unwrap();
-        assert!(matches!(event, ParseEvent::NeedData { min_bytes: 512 }));
+        assert!(matches!(
+            event.event,
+            ParseEvent::NeedData { min_bytes: 512 }
+        ));
     }
 
     #[test]
@@ -1109,7 +1151,10 @@ mod tests {
         let data = [0u8; 512];
 
         let event = parser.parse(&data).unwrap();
-        assert!(matches!(event, ParseEvent::NeedData { min_bytes: 1024 }));
+        assert!(matches!(
+            event.event,
+            ParseEvent::NeedData { min_bytes: 1024 }
+        ));
     }
 
     #[test]
@@ -1150,7 +1195,10 @@ mod tests {
 
         let event = parser.parse(&data).unwrap();
         match event {
-            ParseEvent::Entry { consumed, entry } => {
+            Parsed {
+                consumed,
+                event: ParseEvent::Entry(entry),
+            } => {
                 assert_eq!(consumed, 512);
                 assert_eq!(entry.path_lossy(), "test.txt");
                 assert_eq!(entry.size, 0);
@@ -1164,7 +1212,13 @@ mod tests {
 
         // Now parse end
         let event = parser.parse(&data[512..]).unwrap();
-        assert!(matches!(event, ParseEvent::End { consumed: 1024 }));
+        assert!(matches!(
+            event,
+            Parsed {
+                consumed: 1024,
+                event: ParseEvent::End
+            }
+        ));
     }
 
     #[test]
@@ -1196,7 +1250,10 @@ mod tests {
 
         let event = parser.parse(&data).unwrap();
         match event {
-            ParseEvent::Entry { consumed, entry } => {
+            Parsed {
+                consumed,
+                event: ParseEvent::Entry(entry),
+            } => {
                 assert_eq!(consumed, 512);
                 assert_eq!(entry.path_lossy(), "test.txt");
                 assert_eq!(entry.size, 5);
@@ -1212,7 +1269,13 @@ mod tests {
 
         // Parse end (zero blocks at 1024..2048)
         let event = parser.parse(&data[1024..]).unwrap();
-        assert!(matches!(event, ParseEvent::End { consumed: 1024 }));
+        assert!(matches!(
+            event,
+            Parsed {
+                consumed: 1024,
+                event: ParseEvent::End
+            }
+        ));
     }
 
     // =========================================================================
@@ -1398,23 +1461,23 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         // Should consume GNU long name header + content + actual header
-        let consumed = match &event {
-            ParseEvent::Entry { consumed, entry } => {
-                assert!(*consumed > 512);
+        let consumed = event.consumed;
+        match &event.event {
+            ParseEvent::Entry(entry) => {
+                assert!(consumed > 512);
                 assert_eq!(entry.path.as_ref(), long_name.as_bytes());
                 assert_eq!(entry.size, 5);
                 assert!(entry.is_file());
-                *consumed
             }
             other => panic!("Expected Entry, got {:?}", other),
-        };
+        }
 
         parser.advance_content(5).unwrap();
 
         // Parse end
         let remaining = &archive[consumed + 512..];
         let event = parser.parse(remaining).unwrap();
-        assert!(matches!(event, ParseEvent::End { .. }));
+        assert!(matches!(event.event, ParseEvent::End));
     }
 
     // =========================================================================
@@ -1436,24 +1499,24 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let event = parser.parse(&archive).unwrap();
 
-        let consumed = match &event {
-            ParseEvent::Entry { consumed, entry } => {
+        let consumed = event.consumed;
+        match &event.event {
+            ParseEvent::Entry(entry) => {
                 assert_eq!(entry.path.as_ref(), b"mylink");
                 assert!(entry.is_symlink());
                 assert_eq!(
                     entry.link_target.as_ref().unwrap().as_ref(),
                     long_target.as_bytes()
                 );
-                *consumed
             }
             other => panic!("Expected Entry, got {:?}", other),
-        };
+        }
 
         parser.advance_content(0).unwrap();
 
         let remaining = &archive[consumed..];
         let event = parser.parse(remaining).unwrap();
-        assert!(matches!(event, ParseEvent::End { .. }));
+        assert!(matches!(event.event, ParseEvent::End));
     }
 
     // =========================================================================
@@ -1474,7 +1537,10 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert_eq!(entry.path.as_ref(), pax_path.as_bytes());
             }
             other => panic!("Expected Entry, got {:?}", other),
@@ -1495,7 +1561,10 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert_eq!(entry.size, 999);
             }
             other => panic!("Expected Entry, got {:?}", other),
@@ -1518,7 +1587,10 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert_eq!(entry.uid, 65534);
                 assert_eq!(entry.gid, 65535);
                 // mtime should be the integer part only
@@ -1546,7 +1618,10 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert_eq!(entry.xattrs.len(), 2);
 
                 // Check xattrs (order should be preserved)
@@ -1577,7 +1652,10 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert!(entry.is_symlink());
                 assert_eq!(
                     entry.link_target.as_ref().unwrap().as_ref(),
@@ -1683,7 +1761,10 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 // PAX path should override GNU long name
                 assert_eq!(entry.path.as_ref(), pax_path.as_bytes());
             }
@@ -1707,7 +1788,10 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert_eq!(entry.path.as_ref(), long_name.as_bytes());
                 assert_eq!(
                     entry.link_target.as_ref().unwrap().as_ref(),
@@ -1744,33 +1828,33 @@ mod tests {
 
         // Parse first entry
         let event1 = parser.parse(&archive).unwrap();
-        let consumed1 = match &event1 {
-            ParseEvent::Entry { consumed, entry } => {
+        match &event1.event {
+            ParseEvent::Entry(entry) => {
                 assert_eq!(entry.path.as_ref(), b"first/file.txt");
                 assert_eq!(entry.size, 5);
-                *consumed
             }
             other => panic!("Expected Entry, got {:?}", other),
-        };
+        }
+        let consumed1 = event1.consumed;
         parser.advance_content(5).unwrap();
 
         // Parse second entry
         let offset = consumed1 + 512;
         let event2 = parser.parse(&archive[offset..]).unwrap();
-        let consumed2 = match &event2 {
-            ParseEvent::Entry { consumed, entry } => {
+        match &event2.event {
+            ParseEvent::Entry(entry) => {
                 assert_eq!(entry.path.as_ref(), b"second/file.txt");
                 assert_eq!(entry.size, 5);
-                *consumed
             }
             other => panic!("Expected Entry, got {:?}", other),
-        };
+        }
+        let consumed2 = event2.consumed;
         parser.advance_content(5).unwrap();
 
         // Parse end
         let final_offset = offset + consumed2 + 512;
         let event3 = parser.parse(&archive[final_offset..]).unwrap();
-        assert!(matches!(event3, ParseEvent::End { .. }));
+        assert!(matches!(event3.event, ParseEvent::End));
     }
 
     #[test]
@@ -1788,7 +1872,10 @@ mod tests {
         let event = parser.parse(&archive).unwrap();
 
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert_eq!(entry.uname.as_ref().unwrap().as_ref(), b"testuser");
                 assert_eq!(entry.gname.as_ref().unwrap().as_ref(), b"testgroup");
             }
@@ -1877,7 +1964,7 @@ mod tests {
         let event = parser.parse(&header).unwrap();
 
         // Need header (512) + padded content (512)
-        match event {
+        match event.event {
             ParseEvent::NeedData { min_bytes } => {
                 assert!(min_bytes > 512);
             }
@@ -1893,7 +1980,7 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let event = parser.parse(&header).unwrap();
 
-        match event {
+        match event.event {
             ParseEvent::NeedData { min_bytes } => {
                 assert!(min_bytes > 512);
             }
@@ -1939,8 +2026,8 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let event = parser.parse(&archive).unwrap();
 
-        let consumed = match &event {
-            ParseEvent::Entry { consumed, entry } => {
+        match &event.event {
+            ParseEvent::Entry(entry) => {
                 // CRITICAL: entry.size MUST be 1024 (from PAX), not 0 (from header)
                 assert_eq!(
                     entry.size, 1024,
@@ -1955,20 +2042,26 @@ mod tests {
 
                 // Advance past content
                 parser.advance_content(entry.size).unwrap();
-                *consumed
             }
             other => panic!("Expected Entry, got {:?}", other),
-        };
+        }
+        let consumed = event.consumed;
 
         // Continue parsing - should get End, NOT another entry
         let remaining = &archive[consumed + 1024..]; // consumed headers + 1024 bytes content
         let event = parser.parse(remaining).unwrap();
 
         match event {
-            ParseEvent::End { .. } => {
+            Parsed {
+                event: ParseEvent::End,
+                ..
+            } => {
                 // Correct! Parser properly skipped the 1024-byte content
             }
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 panic!(
                     "CVE-2025-62518 VULNERABLE: Parser found unexpected entry '{}' \
                      because it used header size (0) instead of PAX size (1024)",
@@ -1999,7 +2092,10 @@ mod tests {
         // Parse entry
         let event = parser.parse(&archive).unwrap();
         let size = match event {
-            ParseEvent::Entry { entry, .. } => entry.size,
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => entry.size,
             other => panic!("Expected Entry, got {:?}", other),
         };
 
@@ -2008,7 +2104,7 @@ mod tests {
         // Parser should now be in ReadContent state expecting 512 bytes
         // If we try to parse again without advancing, it should return NeedData
         let event = parser.parse(&[]).unwrap();
-        match event {
+        match event.event {
             ParseEvent::NeedData { min_bytes } => {
                 assert_eq!(min_bytes, 512, "Parser must expect PAX size bytes");
             }
@@ -2084,7 +2180,10 @@ mod tests {
         let mut parser = Parser::new(limits);
         let event = parser.parse(&archive).unwrap();
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 // Should fall back to header uid (1000 from make_header)
                 assert_eq!(entry.uid, 1000);
             }
@@ -2102,7 +2201,10 @@ mod tests {
         let mut parser = Parser::new(limits);
         let event = parser.parse(&archive).unwrap();
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 // Should fall back to header size (0 from make_header)
                 assert_eq!(entry.size, 0);
             }
@@ -2125,7 +2227,10 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let event = parser.parse(&archive).unwrap();
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert_eq!(entry.uid, 2000);
                 assert_eq!(entry.gid, 3000);
                 assert_eq!(entry.size, 42);
@@ -2141,7 +2246,10 @@ mod tests {
         let mut parser = Parser::new(Limits::default());
         let event = parser.parse(&archive).unwrap();
         match event {
-            ParseEvent::Entry { entry, .. } => {
+            Parsed {
+                event: ParseEvent::Entry(entry),
+                ..
+            } => {
                 assert_eq!(entry.mtime, 1234567890);
             }
             other => panic!("Expected Entry, got {other:?}"),
