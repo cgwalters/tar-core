@@ -282,6 +282,7 @@ pub type Result<T> = std::result::Result<T, ParseError>;
 
 /// Events emitted by the sans-IO parser.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ParseEvent<'a> {
     /// Need more data to continue parsing.
     ///
@@ -393,6 +394,14 @@ pub struct ParsedEntry<'a> {
     /// Extended attributes from PAX `SCHILY.xattr.*` entries.
     #[allow(clippy::type_complexity)]
     pub xattrs: Vec<(Cow<'a, [u8]>, Cow<'a, [u8]>)>,
+
+    /// Raw PAX extended header data, if a PAX `'x'` entry preceded this entry.
+    ///
+    /// This is the unprocessed content of the PAX extension entry, preserved
+    /// so that callers can iterate all PAX key-value pairs (not just the ones
+    /// tar-core resolves into struct fields). Parse it with
+    /// [`PaxExtensions::new`](crate::PaxExtensions::new).
+    pub pax: Option<Vec<u8>>,
 }
 
 impl<'a> ParsedEntry<'a> {
@@ -907,7 +916,8 @@ impl Parser {
         }
 
         // Apply PAX extensions (highest priority)
-        if let Some(ref pax) = self.pending.pax_extensions {
+        let raw_pax = self.pending.pax_extensions.take();
+        if let Some(ref pax) = raw_pax {
             let strict = self.limits.strict;
             let extensions = PaxExtensions::new(pax);
 
@@ -1054,6 +1064,7 @@ impl Parser {
             dev_major: header.device_major()?,
             dev_minor: header.device_minor()?,
             xattrs,
+            pax: raw_pax,
         };
 
         // Only consume the header - content is left for caller
@@ -1572,6 +1583,81 @@ mod tests {
                     entry.xattrs[1].1.as_ref(),
                     b"system_u:object_r:unlabeled_t:s0"
                 );
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_pax_raw_bytes_preserved() {
+        // The raw PAX data should be available in ParsedEntry::pax
+        // so callers can iterate all key-value pairs, not just the ones
+        // tar-core resolves into struct fields.
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[
+            ("path", b"custom/path.txt"),
+            ("SCHILY.xattr.user.key", b"val"),
+            ("myfancykey", b"myfancyvalue"),
+        ]));
+        archive.extend_from_slice(&make_header(b"orig.txt", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                // Resolved fields work as before
+                assert_eq!(entry.path.as_ref(), b"custom/path.txt");
+                assert_eq!(entry.xattrs.len(), 1);
+
+                // Raw PAX data is preserved
+                let raw = entry.pax.as_ref().expect("pax should be Some");
+                let exts = PaxExtensions::new(raw);
+                let keys: Vec<&str> = exts
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.key().ok())
+                    .collect();
+                assert_eq!(keys, &["path", "SCHILY.xattr.user.key", "myfancykey"]);
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_no_pax_means_none() {
+        // Entries without PAX extensions should have pax == None
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&make_header(b"plain.txt", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert!(entry.pax.is_none());
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_gnu_long_name_no_pax() {
+        // GNU long name without PAX should still have pax == None
+        let long_name = "long/path/".to_string() + &"x".repeat(100);
+        let mut archive = Vec::new();
+        archive.extend(make_gnu_long_name(long_name.as_bytes()));
+        archive.extend_from_slice(&make_header(b"short", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.path.as_ref(), long_name.as_bytes());
+                assert!(entry.pax.is_none());
             }
             other => panic!("Expected Entry, got {:?}", other),
         }
