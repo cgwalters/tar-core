@@ -11,7 +11,7 @@ use std::fs;
 use std::path::Path;
 
 use tar_core::builder::EntryBuilder;
-use tar_core::{EntryType, HEADER_SIZE};
+use tar_core::{EntryType, SparseEntry, HEADER_SIZE};
 
 /// End-of-archive marker: two 512-byte zero blocks.
 const EOA: [u8; 1024] = [0u8; 1024];
@@ -567,6 +567,203 @@ fn main() {
         let mut archive = raw.to_vec();
         archive.extend_from_slice(&EOA);
         seeds.push(("v7_format", archive));
+    }
+
+    // 28. GNU sparse, 2 inline entries
+    {
+        let sparse_map = [
+            SparseEntry {
+                offset: 0,
+                length: 100,
+            },
+            SparseEntry {
+                offset: 1000,
+                length: 200,
+            },
+        ];
+        let on_disk: u64 = 300;
+        let real_size: u64 = 1200;
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"sparse_gnu_basic.bin")
+            .entry_type(EntryType::Regular)
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+        let hdr = builder.finish_bytes();
+        let mut archive = hdr;
+        archive.extend(vec![0u8; on_disk.next_multiple_of(512) as usize]);
+        archive.extend_from_slice(&EOA);
+        seeds.push(("sparse_gnu_basic", archive));
+    }
+
+    // 29. GNU sparse, 6 entries (needs extension block: >4 inline descriptors)
+    {
+        let sparse_map: Vec<SparseEntry> = (0..6)
+            .map(|i| SparseEntry {
+                offset: i * 1000,
+                length: 50,
+            })
+            .collect();
+        let on_disk: u64 = 300;
+        let real_size: u64 = 5050;
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"sparse_gnu_ext.bin")
+            .entry_type(EntryType::Regular)
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+        let hdr = builder.finish_bytes();
+        let mut archive = hdr;
+        archive.extend(vec![0u8; on_disk.next_multiple_of(512) as usize]);
+        archive.extend_from_slice(&EOA);
+        seeds.push(("sparse_gnu_ext", archive));
+    }
+
+    // 30. GNU sparse, 28 entries (multiple extension blocks: 4 inline + 21 + 3)
+    {
+        let sparse_map: Vec<SparseEntry> = (0..28)
+            .map(|i| SparseEntry {
+                offset: i * 500,
+                length: 30,
+            })
+            .collect();
+        let on_disk: u64 = 28 * 30;
+        let real_size: u64 = 27 * 500 + 30;
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"sparse_gnu_multi_ext.bin")
+            .entry_type(EntryType::Regular)
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+        let hdr = builder.finish_bytes();
+        let mut archive = hdr;
+        archive.extend(vec![0u8; on_disk.next_multiple_of(512) as usize]);
+        archive.extend_from_slice(&EOA);
+        seeds.push(("sparse_gnu_multi_ext", archive));
+    }
+
+    // 31. PAX sparse v1.0, 2 entries
+    {
+        let sparse_map = [
+            SparseEntry {
+                offset: 0,
+                length: 100,
+            },
+            SparseEntry {
+                offset: 3000,
+                length: 400,
+            },
+        ];
+        let on_disk: u64 = 500;
+        let real_size: u64 = 3400;
+        let mut builder = EntryBuilder::new_ustar();
+        builder
+            .path(b"sparse_pax_basic.dat")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+        let hdr = builder.finish_bytes();
+        let mut archive = hdr;
+        archive.extend(vec![0u8; on_disk.next_multiple_of(512) as usize]);
+        archive.extend_from_slice(&EOA);
+        seeds.push(("sparse_pax_basic", archive));
+    }
+
+    // 32. PAX sparse v1.0, 10 entries
+    {
+        let sparse_map: Vec<SparseEntry> = (0..10)
+            .map(|i| SparseEntry {
+                offset: i * 1000,
+                length: 50,
+            })
+            .collect();
+        let on_disk: u64 = 500;
+        let real_size: u64 = 9050;
+        let mut builder = EntryBuilder::new_ustar();
+        builder
+            .path(b"sparse_pax_many.dat")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+        let hdr = builder.finish_bytes();
+        let mut archive = hdr;
+        archive.extend(vec![0u8; on_disk.next_multiple_of(512) as usize]);
+        archive.extend_from_slice(&EOA);
+        seeds.push(("sparse_pax_many", archive));
+    }
+
+    // 33. GNU sparse with long path (>100 bytes)
+    {
+        let long_path = "sparse/".repeat(20) + "data.bin"; // 148 chars
+        let sparse_map = [
+            SparseEntry {
+                offset: 0,
+                length: 200,
+            },
+            SparseEntry {
+                offset: 4096,
+                length: 100,
+            },
+        ];
+        let on_disk: u64 = 300;
+        let real_size: u64 = 4196;
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(long_path.as_bytes())
+            .entry_type(EntryType::Regular)
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+        let hdr = builder.finish_bytes();
+        let mut archive = hdr;
+        archive.extend(vec![0u8; on_disk.next_multiple_of(512) as usize]);
+        archive.extend_from_slice(&EOA);
+        seeds.push(("sparse_gnu_longpath", archive));
+    }
+
+    // 34. PAX sparse with long path (>100 bytes)
+    {
+        let long_path = "paxsparse/".repeat(15) + "file.dat"; // 158 chars
+        let sparse_map = [
+            SparseEntry {
+                offset: 0,
+                length: 512,
+            },
+            SparseEntry {
+                offset: 8192,
+                length: 256,
+            },
+        ];
+        let on_disk: u64 = 768;
+        let real_size: u64 = 8448;
+        let mut builder = EntryBuilder::new_ustar();
+        builder
+            .path(long_path.as_bytes())
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+        let hdr = builder.finish_bytes();
+        let mut archive = hdr;
+        archive.extend(vec![0u8; on_disk.next_multiple_of(512) as usize]);
+        archive.extend_from_slice(&EOA);
+        seeds.push(("sparse_pax_longpath", archive));
     }
 
     // Write seeds

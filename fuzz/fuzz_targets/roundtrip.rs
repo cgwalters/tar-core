@@ -10,7 +10,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
 use tar_core::builder::EntryBuilder;
 use tar_core::parse::{Limits, ParseEvent, Parser};
-use tar_core::{EntryType, HEADER_SIZE};
+use tar_core::{EntryType, SparseEntry, HEADER_SIZE};
 
 #[derive(Debug, Arbitrary)]
 struct FuzzEntry {
@@ -26,6 +26,10 @@ struct FuzzEntry {
     /// Selects entry type: 0=Regular, 1=Directory, 2=Symlink, 3=Hardlink
     entry_kind: u8,
     link_target_bytes: Vec<u8>,
+    /// (gap, length) pairs to build a sparse map
+    sparse_entries: Vec<(u16, u16)>,
+    /// When true and entry_kind selects Regular, build a sparse entry
+    use_sparse: bool,
 }
 
 /// Strip NUL bytes, ensure non-empty, clamp length.
@@ -64,6 +68,27 @@ fuzz_target!(|data: &[u8]| {
     let uid = entry.uid as u64;
     let gid = entry.gid as u64;
     let mtime = entry.mtime as u64;
+
+    // Build sparse map if applicable
+    let is_sparse = entry.use_sparse && entry.entry_kind % 4 == 0;
+    let sparse_map: Vec<SparseEntry> = if is_sparse {
+        let mut map = Vec::new();
+        let mut cursor = 0u64;
+        for &(gap, length) in entry.sparse_entries.iter().take(50) {
+            if length == 0 {
+                continue;
+            }
+            let offset = cursor.saturating_add(gap as u64);
+            map.push(SparseEntry {
+                offset,
+                length: length as u64,
+            });
+            cursor = offset.saturating_add(length as u64);
+        }
+        map
+    } else {
+        Vec::new()
+    };
 
     // Pick entry type and adjust content/link accordingly
     let (entry_type, link_target) = match entry.entry_kind % 4 {
@@ -111,10 +136,29 @@ fuzz_target!(|data: &[u8]| {
         };
     }
 
+    // For sparse entries, the on-disk size is the sum of sparse chunk lengths
+    // and content is just zero-filled padding.
+    let on_disk_size: u64;
+    let real_size: u64;
+    if is_sparse && !sparse_map.is_empty() {
+        on_disk_size = sparse_map.iter().map(|e| e.length).sum();
+        real_size = sparse_map.last().map(|e| e.offset + e.length).unwrap_or(0);
+        content = vec![0u8; on_disk_size as usize];
+        builder.sparse(&sparse_map, real_size);
+    } else if is_sparse {
+        // Empty sparse map: treat as empty regular file
+        on_disk_size = 0;
+        real_size = 0;
+        content.clear();
+    } else {
+        on_disk_size = content.len() as u64;
+        real_size = 0; // unused for non-sparse
+    }
+
     try_set!(builder.mode(mode));
     try_set!(builder.uid(uid));
     try_set!(builder.gid(gid));
-    try_set!(builder.size(content.len() as u64));
+    try_set!(builder.size(on_disk_size));
     try_set!(builder.mtime(mtime));
 
     // For GNU, truncate uname/gname to 32 bytes
@@ -153,23 +197,63 @@ fuzz_target!(|data: &[u8]| {
     let mut offset = 0;
 
     let input = &archive[offset..];
-    let parsed_entry = match parser.parse(input) {
-        Ok(ParseEvent::Entry { consumed, entry }) => {
+    let event = match parser.parse(input) {
+        Ok(e) => e,
+        other => {
+            panic!("expected successful parse from archive we just built, got: {other:?}");
+        }
+    };
+
+    // Extract parsed entry and verify sparse-specific fields
+    let parsed_entry = match event {
+        ParseEvent::Entry { consumed, entry } => {
+            assert!(
+                !is_sparse || sparse_map.is_empty(),
+                "expected SparseEntry for non-empty sparse, got Entry"
+            );
+            offset += consumed;
+            entry
+        }
+        ParseEvent::SparseEntry {
+            consumed,
+            entry,
+            sparse_map: parsed_sparse_map,
+            real_size: parsed_real_size,
+        } => {
+            assert!(
+                is_sparse && !sparse_map.is_empty(),
+                "expected Entry for non-sparse, got SparseEntry"
+            );
+            assert_eq!(
+                sparse_map.len(),
+                parsed_sparse_map.len(),
+                "sparse_map length mismatch"
+            );
+            for (i, expected) in sparse_map.iter().enumerate() {
+                assert_eq!(*expected, parsed_sparse_map[i], "sparse_map[{i}] mismatch");
+            }
+            assert_eq!(real_size, parsed_real_size, "real_size mismatch");
             offset += consumed;
             entry
         }
         other => {
-            panic!("expected Entry from archive we just built, got: {other:?}");
+            panic!("expected Entry or SparseEntry from archive we just built, got: {other:?}");
         }
     };
 
     // Verify roundtrip
     assert_eq!(path, parsed_entry.path.as_ref(), "path mismatch");
-    assert_eq!(entry_type, parsed_entry.entry_type, "entry_type mismatch");
+    if is_sparse && !sparse_map.is_empty() {
+        // Sparse entries have GnuSparse type in GNU mode; in PAX mode
+        // the parser may report Regular. Just check on-disk size.
+        assert_eq!(on_disk_size, parsed_entry.size, "on-disk size mismatch");
+    } else {
+        assert_eq!(entry_type, parsed_entry.entry_type, "entry_type mismatch");
+        assert_eq!(content.len() as u64, parsed_entry.size, "size mismatch");
+    }
     assert_eq!(mode, parsed_entry.mode, "mode mismatch");
     assert_eq!(uid, parsed_entry.uid, "uid mismatch");
     assert_eq!(gid, parsed_entry.gid, "gid mismatch");
-    assert_eq!(content.len() as u64, parsed_entry.size, "size mismatch");
     assert_eq!(mtime, parsed_entry.mtime, "mtime mismatch");
 
     // Verify link target for symlinks/hardlinks
@@ -200,8 +284,8 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // Verify content (only for regular files)
-    if !content.is_empty() {
+    // Verify content (only for non-sparse regular files)
+    if !is_sparse && !content.is_empty() {
         let parsed_content = &archive[offset..offset + content.len()];
         assert_eq!(content, parsed_content, "content mismatch");
     }
