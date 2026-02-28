@@ -25,7 +25,10 @@ fn run_parser(data: &[u8], limits: Limits) {
         match parser.parse(input) {
             Ok(ParseEvent::NeedData { .. }) => break,
 
-            Ok(ParseEvent::Entry { consumed, entry }) => {
+            Ok(ParseEvent::Entry { consumed, entry })
+            | Ok(ParseEvent::SparseEntry {
+                consumed, entry, ..
+            }) => {
                 // consumed bytes must not exceed remaining input
                 assert!(
                     consumed <= input.len(),

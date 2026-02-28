@@ -287,6 +287,18 @@ impl fmt::Debug for UstarHeader {
     }
 }
 
+/// A decoded sparse file data region.
+///
+/// Each entry describes a contiguous region of real data within a sparse
+/// file. Gaps between entries are implicitly zero-filled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseEntry {
+    /// Byte offset of this data region within the logical file.
+    pub offset: u64,
+    /// Number of bytes of real data in this region.
+    pub length: u64,
+}
+
 /// GNU tar sparse file chunk descriptor.
 ///
 /// Each descriptor specifies a region of data in a sparse file.
@@ -298,6 +310,29 @@ pub struct GnuSparseHeader {
     pub offset: [u8; 12],
     /// Number of bytes in this chunk.
     pub numbytes: [u8; 12],
+}
+
+impl GnuSparseHeader {
+    /// Returns true if this descriptor is empty (offset or numbytes starts
+    /// with a zero byte, indicating an unused slot).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.offset[0] == 0 || self.numbytes[0] == 0
+    }
+
+    /// Parse offset and length into a [`SparseEntry`].
+    ///
+    /// Handles both octal ASCII and GNU base-256 encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeaderError::InvalidOctal`] if either field is malformed.
+    pub fn to_sparse_entry(&self) -> Result<SparseEntry> {
+        Ok(SparseEntry {
+            offset: parse_numeric(&self.offset)?,
+            length: parse_numeric(&self.numbytes)?,
+        })
+    }
 }
 
 impl fmt::Debug for GnuSparseHeader {
@@ -499,6 +534,14 @@ pub struct GnuExtSparseHeader {
     pub isextended: u8,
     /// Padding to fill the 512-byte block.
     pub pad: [u8; 7],
+}
+
+impl GnuExtSparseHeader {
+    /// Returns whether another extension block follows this one.
+    #[must_use]
+    pub fn is_extended(&self) -> bool {
+        self.isextended == 1
+    }
 }
 
 impl fmt::Debug for GnuExtSparseHeader {

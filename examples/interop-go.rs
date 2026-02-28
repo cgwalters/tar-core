@@ -432,6 +432,9 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
                     content,
                 });
             }
+            ParseEvent::SparseEntry { .. } => {
+                panic!("unexpected SparseEntry in interop test");
+            }
             ParseEvent::End { .. } => break,
         }
     }

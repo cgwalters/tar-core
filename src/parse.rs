@@ -49,10 +49,12 @@ use std::borrow::Cow;
 use std::str::Utf8Error;
 
 use thiserror::Error;
+use zerocopy::FromBytes;
 
 use crate::{
-    EntryType, Header, HeaderError, PaxError, PaxExtensions, HEADER_SIZE, PAX_GID, PAX_GNAME,
-    PAX_LINKPATH, PAX_MTIME, PAX_PATH, PAX_SCHILY_XATTR, PAX_SIZE, PAX_UID, PAX_UNAME,
+    EntryType, GnuExtSparseHeader, Header, HeaderError, PaxError, PaxExtensions, SparseEntry,
+    HEADER_SIZE, PAX_GID, PAX_GNAME, PAX_LINKPATH, PAX_MTIME, PAX_PATH, PAX_SCHILY_XATTR, PAX_SIZE,
+    PAX_UID, PAX_UNAME,
 };
 
 // ============================================================================
@@ -115,6 +117,18 @@ pub struct Limits {
     /// Default: 16 entries.
     pub max_pending_entries: usize,
 
+    /// Maximum number of sparse data entries (chunks) in a sparse file.
+    ///
+    /// Prevents unbounded memory allocation from a malicious archive that
+    /// claims an enormous number of sparse regions (see CVE-2025-58183 for
+    /// a similar issue in Go's `archive/tar`).
+    ///
+    /// For old GNU sparse format, each 512-byte extension block holds 21
+    /// descriptors, so 1000 entries requires ~48 extension blocks (~24 KiB).
+    ///
+    /// Default: 10000.
+    pub max_sparse_entries: usize,
+
     /// When true, PAX extension values that fail to parse (invalid UTF-8,
     /// invalid integer for numeric fields like `uid`, `gid`, `size`, `mtime`)
     /// cause errors instead of being silently ignored.
@@ -130,6 +144,7 @@ impl Default for Limits {
             max_pax_size: 1024 * 1024, // 1 MiB
             max_gnu_long_size: 4096,
             max_pending_entries: 16,
+            max_sparse_entries: 10_000,
             strict: true,
         }
     }
@@ -153,6 +168,7 @@ impl Limits {
             max_pax_size: u64::MAX,
             max_gnu_long_size: u64::MAX,
             max_pending_entries: usize::MAX,
+            max_sparse_entries: usize::MAX,
             strict: false,
         }
     }
@@ -168,6 +184,7 @@ impl Limits {
             max_pax_size: 64 * 1024, // 64 KiB
             max_gnu_long_size: 1024,
             max_pending_entries: 8,
+            max_sparse_entries: 1000,
             strict: true,
         }
     }
@@ -248,6 +265,19 @@ pub enum ParseError {
         limit: usize,
     },
 
+    /// Too many sparse entries (possible denial-of-service attack).
+    #[error("too many sparse entries: {count} > {limit}")]
+    TooManySparseEntries {
+        /// Number of sparse entries found.
+        count: usize,
+        /// Configured limit.
+        limit: usize,
+    },
+
+    /// Sparse entry type present but header is not GNU format.
+    #[error("sparse entry type but header is not GNU format")]
+    SparseNotGnu,
+
     /// A PAX extension value failed to parse in strict mode.
     #[error("invalid PAX {key} value: {value:?}")]
     InvalidPaxValue {
@@ -309,6 +339,32 @@ pub enum ParseEvent<'a> {
         entry: ParsedEntry<'a>,
     },
 
+    /// A GNU sparse file entry has been parsed.
+    ///
+    /// This is emitted instead of [`Entry`](ParseEvent::Entry) when the entry
+    /// type is `GnuSparse` (type 'S'). The sparse map describes which regions
+    /// of the logical file contain real data; gaps are implicitly zero-filled.
+    ///
+    /// After this event, the caller must read or skip `entry.size` bytes
+    /// of content (the on-disk data for the sparse regions) plus padding to
+    /// the next 512-byte boundary before calling `parse()` again. The
+    /// `consumed` count already includes any GNU sparse extension blocks
+    /// that followed the header.
+    SparseEntry {
+        /// Number of bytes consumed from the input for this entry's header(s),
+        /// including any GNU sparse extension blocks.
+        consumed: usize,
+        /// The parsed entry with resolved metadata.
+        /// `entry.size` is the on-disk content size (sum of sparse chunk
+        /// lengths). The logical file size is `real_size`.
+        entry: ParsedEntry<'a>,
+        /// The sparse data map: regions of real data within the logical file.
+        sparse_map: Vec<SparseEntry>,
+        /// The logical (uncompressed) size of the file, from the GNU header's
+        /// `realsize` field.
+        real_size: u64,
+    },
+
     /// Archive end marker reached (two consecutive zero blocks, or clean EOF).
     End {
         /// Number of bytes consumed from the input.
@@ -321,7 +377,7 @@ impl<'a> ParseEvent<'a> {
     /// already consumed from the front of the original input before the
     /// sub-slice was handed to a recursive `parse_header` call.
     ///
-    /// For `Entry` and `End`, `n` is added to `consumed`.
+    /// For `Entry`, `SparseEntry`, and `End`, `n` is added to `consumed`.
     ///
     /// For `NeedData`, `n` is added to `min_bytes` so the requirement is
     /// expressed relative to the *original* input buffer, not the sub-slice.
@@ -333,6 +389,17 @@ impl<'a> ParseEvent<'a> {
             ParseEvent::Entry { consumed, entry } => ParseEvent::Entry {
                 consumed: consumed + n,
                 entry,
+            },
+            ParseEvent::SparseEntry {
+                consumed,
+                entry,
+                sparse_map,
+                real_size,
+            } => ParseEvent::SparseEntry {
+                consumed: consumed + n,
+                entry,
+                sparse_map,
+                real_size,
             },
             ParseEvent::End { consumed } => ParseEvent::End {
                 consumed: consumed + n,
@@ -473,6 +540,16 @@ struct PendingMetadata {
     gnu_long_link: Option<Vec<u8>>,
     pax_extensions: Option<Vec<u8>>,
     count: usize,
+}
+
+/// Context for GNU sparse entries, passed from `handle_gnu_sparse` to
+/// `emit_entry` to produce a `ParseEvent::SparseEntry`.
+struct SparseContext {
+    sparse_map: Vec<SparseEntry>,
+    real_size: u64,
+    /// Number of bytes consumed by extension blocks (not counting the
+    /// main header itself).
+    ext_consumed: usize,
 }
 
 impl PendingMetadata {
@@ -680,9 +757,10 @@ impl Parser {
                 self.parse_header(&input[total_size as usize..])
                     .map(|e| e.add_consumed(total_size as usize))
             }
+            EntryType::GnuSparse => self.handle_gnu_sparse(input, header, size),
             _ => {
                 // Actual entry - resolve metadata and emit
-                self.emit_entry(header, size)
+                self.emit_entry(header, size, None)
             }
         }
     }
@@ -790,7 +868,97 @@ impl Parser {
         result
     }
 
-    fn emit_entry<'a>(&mut self, header: &'a Header, size: u64) -> Result<ParseEvent<'a>> {
+    /// Handle a GNU sparse entry (type 'S').
+    ///
+    /// Reads the inline sparse descriptors from the GNU header and any
+    /// extension blocks that follow. Returns NeedData if the extension
+    /// blocks aren't fully available yet (side-effect-free: no state is
+    /// mutated before we know we have enough data).
+    fn handle_gnu_sparse<'a>(
+        &mut self,
+        input: &'a [u8],
+        header: &'a Header,
+        size: u64,
+    ) -> Result<ParseEvent<'a>> {
+        let gnu = header.try_as_gnu().ok_or(ParseError::SparseNotGnu)?;
+        let real_size = gnu.real_size()?;
+
+        // Collect sparse entries from the 4 inline descriptors.
+        let mut sparse_map = Vec::new();
+        for desc in &gnu.sparse {
+            if desc.is_empty() {
+                break;
+            }
+            let entry = desc.to_sparse_entry()?;
+            sparse_map.push(entry);
+        }
+
+        // If there are extension blocks, we need to read them all.
+        // Each extension block is 512 bytes and may chain to the next.
+        // We must not mutate any state before we know we have enough input,
+        // so we scan forward to find all extension blocks first.
+        let mut ext_consumed = 0usize;
+        if gnu.is_extended() {
+            let mut offset = HEADER_SIZE; // start past the main header
+            loop {
+                if input.len() < offset + HEADER_SIZE {
+                    return Ok(ParseEvent::NeedData {
+                        min_bytes: offset + HEADER_SIZE,
+                    });
+                }
+
+                let ext_bytes: &[u8; HEADER_SIZE] = input[offset..offset + HEADER_SIZE]
+                    .try_into()
+                    .expect("checked length");
+                let ext = GnuExtSparseHeader::ref_from_bytes(ext_bytes)
+                    .expect("GnuExtSparseHeader is 512 bytes");
+
+                for desc in &ext.sparse {
+                    if desc.is_empty() {
+                        break;
+                    }
+                    if sparse_map.len() >= self.limits.max_sparse_entries {
+                        return Err(ParseError::TooManySparseEntries {
+                            count: sparse_map.len() + 1,
+                            limit: self.limits.max_sparse_entries,
+                        });
+                    }
+                    let entry = desc.to_sparse_entry()?;
+                    sparse_map.push(entry);
+                }
+
+                offset += HEADER_SIZE;
+
+                if !ext.is_extended() {
+                    break;
+                }
+            }
+            ext_consumed = offset - HEADER_SIZE; // bytes consumed by extension blocks
+        }
+
+        // Also check the inline descriptors against the limit.
+        if sparse_map.len() > self.limits.max_sparse_entries {
+            return Err(ParseError::TooManySparseEntries {
+                count: sparse_map.len(),
+                limit: self.limits.max_sparse_entries,
+            });
+        }
+
+        let sparse_ctx = SparseContext {
+            sparse_map,
+            real_size,
+            ext_consumed,
+        };
+
+        self.emit_entry(header, size, Some(sparse_ctx))
+    }
+
+    fn emit_entry<'a>(
+        &mut self,
+        header: &'a Header,
+        size: u64,
+        sparse: Option<SparseContext>,
+    ) -> Result<ParseEvent<'a>> {
         // Start with header values
         let mut path: Cow<'a, [u8]> = Cow::Borrowed(header.path_bytes());
         let mut link_target: Option<Cow<'a, [u8]>> = None;
@@ -973,11 +1141,21 @@ impl Parser {
             pax: raw_pax,
         };
 
-        // Only consume the header - content is left for caller
-        Ok(ParseEvent::Entry {
-            consumed: HEADER_SIZE,
-            entry,
-        })
+        if let Some(ctx) = sparse {
+            // Consume the main header plus any extension blocks.
+            Ok(ParseEvent::SparseEntry {
+                consumed: HEADER_SIZE + ctx.ext_consumed,
+                entry,
+                sparse_map: ctx.sparse_map,
+                real_size: ctx.real_size,
+            })
+        } else {
+            // Only consume the header - content is left for caller
+            Ok(ParseEvent::Entry {
+                consumed: HEADER_SIZE,
+                entry,
+            })
+        }
     }
 }
 

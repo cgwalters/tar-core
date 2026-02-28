@@ -58,7 +58,10 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
 
         match parser.parse(input) {
             Ok(ParseEvent::NeedData { .. }) => break,
-            Ok(ParseEvent::Entry { consumed, entry }) => {
+            Ok(ParseEvent::Entry { consumed, entry })
+            | Ok(ParseEvent::SparseEntry {
+                consumed, entry, ..
+            }) => {
                 offset += consumed;
 
                 let size = entry.size;
