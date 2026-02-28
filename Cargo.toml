@@ -34,3 +34,4 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 # Standalone workspace (not part of parent workspace)
 [workspace]
+exclude = ["fuzz"]

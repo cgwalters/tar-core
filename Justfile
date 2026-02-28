@@ -40,6 +40,18 @@ kani-proof name:
 kani-list:
     cargo kani list
 
+# Run a cargo-fuzz target (e.g., `just fuzz parse`, `just fuzz roundtrip -- -max_total_time=60`)
+fuzz target *ARGS:
+    cargo +nightly fuzz run {{target}} {{ARGS}}
+
+# List available fuzz targets
+fuzz-list:
+    cargo fuzz list
+
+# Generate seed corpus for the parse fuzz target
+generate-corpus:
+    cargo run --manifest-path fuzz/Cargo.toml --bin generate-corpus
+
 # Clean build artifacts
 clean:
     cargo clean
