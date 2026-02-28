@@ -121,12 +121,6 @@ pub struct Limits {
     ///
     /// Default: `true`.
     pub strict: bool,
-
-    /// When true, entries with an empty path (after applying all overrides)
-    /// cause an [`ParseError::EmptyPath`] error.
-    ///
-    /// Default: `true`.
-    pub reject_empty_path: bool,
 }
 
 impl Default for Limits {
@@ -137,7 +131,6 @@ impl Default for Limits {
             max_gnu_long_size: 4096,
             max_pending_entries: 16,
             strict: true,
-            reject_empty_path: true,
         }
     }
 }
@@ -161,7 +154,6 @@ impl Limits {
             max_gnu_long_size: u64::MAX,
             max_pending_entries: usize::MAX,
             strict: false,
-            reject_empty_path: false,
         }
     }
 
@@ -177,7 +169,6 @@ impl Limits {
             max_gnu_long_size: 1024,
             max_pending_entries: 8,
             strict: true,
-            reject_empty_path: true,
         }
     }
 }
@@ -271,7 +262,7 @@ pub enum ParseError {
     EmptyPath,
 
     /// Entry size in header is invalid (e.g., overflow when computing padded size).
-    #[error("entry size overflow: {0}")]
+    #[error("invalid entry size: {0}")]
     InvalidSize(u64),
 
     /// Unexpected EOF while reading entry content or padding.
@@ -471,8 +462,16 @@ enum State {
     Done,
 }
 
+/// The kind of extension header being processed.
+#[derive(Debug, Clone, Copy)]
+enum ExtensionKind {
+    GnuLongName,
+    GnuLongLink,
+    Pax,
+}
+
 /// Pending metadata from GNU/PAX extension entries.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct PendingMetadata {
     gnu_long_name: Option<Vec<u8>>,
     gnu_long_link: Option<Vec<u8>>,
@@ -543,6 +542,9 @@ pub struct Parser {
     limits: Limits,
     state: State,
     pending: PendingMetadata,
+    /// When true, entries with empty paths are allowed through instead of
+    /// returning [`ParseError::EmptyPath`].
+    allow_empty_path: bool,
 }
 
 impl Parser {
@@ -553,7 +555,14 @@ impl Parser {
             limits,
             state: State::ReadHeader,
             pending: PendingMetadata::default(),
+            allow_empty_path: false,
         }
+    }
+
+    /// Allow entries with empty paths instead of rejecting them with
+    /// [`ParseError::EmptyPath`].
+    pub fn set_allow_empty_path(&mut self, allow: bool) {
+        self.allow_empty_path = allow;
     }
 
     /// Create a new parser with default limits.
@@ -710,9 +719,15 @@ impl Parser {
 
         // Handle metadata entry types
         match entry_type {
-            EntryType::GnuLongName => self.handle_gnu_long_name(input, size, padded_size),
-            EntryType::GnuLongLink => self.handle_gnu_long_link(input, size, padded_size),
-            EntryType::XHeader => self.handle_pax_header(input, size, padded_size),
+            EntryType::GnuLongName => {
+                self.handle_extension(input, size, padded_size, ExtensionKind::GnuLongName)
+            }
+            EntryType::GnuLongLink => {
+                self.handle_extension(input, size, padded_size, ExtensionKind::GnuLongLink)
+            }
+            EntryType::XHeader => {
+                self.handle_extension(input, size, padded_size, ExtensionKind::Pax)
+            }
             EntryType::XGlobalHeader => {
                 // Skip global PAX headers
                 let total_size = HEADER_SIZE as u64 + padded_size;
@@ -732,22 +747,53 @@ impl Parser {
         }
     }
 
-    fn handle_gnu_long_name<'a>(
+    /// Process a GNU long name/link or PAX extension entry.
+    ///
+    /// Extracts the extension data, adds it to pending metadata, and
+    /// recurses to parse the next header. If the recursive call returns
+    /// NeedData (not enough input for the following header), the pending
+    /// state is restored so the caller can retry with more data and
+    /// re-parse the entire extension chain from scratch.
+    fn handle_extension<'a>(
         &mut self,
         input: &'a [u8],
         size: u64,
         padded_size: u64,
+        kind: ExtensionKind,
     ) -> Result<ParseEvent<'a>> {
         // Check for duplicate
-        if self.pending.gnu_long_name.is_some() {
-            return Err(ParseError::DuplicateGnuLongName);
+        let slot = match kind {
+            ExtensionKind::GnuLongName => &self.pending.gnu_long_name,
+            ExtensionKind::GnuLongLink => &self.pending.gnu_long_link,
+            ExtensionKind::Pax => &self.pending.pax_extensions,
+        };
+        if slot.is_some() {
+            return Err(match kind {
+                ExtensionKind::GnuLongName => ParseError::DuplicateGnuLongName,
+                ExtensionKind::GnuLongLink => ParseError::DuplicateGnuLongLink,
+                ExtensionKind::Pax => ParseError::DuplicatePaxHeader,
+            });
         }
 
         // Check size limit
-        if size > self.limits.max_gnu_long_size {
-            return Err(ParseError::GnuLongTooLarge {
-                size,
-                limit: self.limits.max_gnu_long_size,
+        let max_size = match kind {
+            ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink => {
+                self.limits.max_gnu_long_size
+            }
+            ExtensionKind::Pax => self.limits.max_pax_size,
+        };
+        if size > max_size {
+            return Err(match kind {
+                ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink => {
+                    ParseError::GnuLongTooLarge {
+                        size,
+                        limit: max_size,
+                    }
+                }
+                ExtensionKind::Pax => ParseError::PaxTooLarge {
+                    size,
+                    limit: max_size,
+                },
             });
         }
 
@@ -763,136 +809,43 @@ impl Parser {
         let content_end = content_start + size as usize;
         let mut data = input[content_start..content_end].to_vec();
 
-        // Strip trailing null
-        if data.last() == Some(&0) {
-            data.pop();
+        // Strip trailing null for GNU long name/link
+        if matches!(
+            kind,
+            ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink
+        ) {
+            if data.last() == Some(&0) {
+                data.pop();
+            }
+            if data.len() > self.limits.max_path_len {
+                return Err(ParseError::PathTooLong {
+                    len: data.len(),
+                    limit: self.limits.max_path_len,
+                });
+            }
         }
 
-        // Check path length
-        if data.len() > self.limits.max_path_len {
-            return Err(ParseError::PathTooLong {
-                len: data.len(),
-                limit: self.limits.max_path_len,
-            });
-        }
+        // Save current pending state, apply the new extension data,
+        // and recurse. If the recursive call needs more data, restore
+        // the saved state so the caller can retry from scratch.
+        let saved = std::mem::take(&mut self.pending);
+        self.pending = PendingMetadata {
+            count: saved.count + 1,
+            ..saved.clone()
+        };
+        let slot = match kind {
+            ExtensionKind::GnuLongName => &mut self.pending.gnu_long_name,
+            ExtensionKind::GnuLongLink => &mut self.pending.gnu_long_link,
+            ExtensionKind::Pax => &mut self.pending.pax_extensions,
+        };
+        *slot = Some(data);
 
-        self.pending.gnu_long_name = Some(data);
-        self.pending.count += 1;
-
-        // Recurse to parse next header. If the recursive call returns
-        // NeedData, roll back the pending state so the caller can retry
-        // with more data (re-parsing this extension header from scratch).
         let result = self
             .parse_header(&input[total_size as usize..])
             .map(|e| e.add_consumed(total_size as usize));
+
         if matches!(result, Ok(ParseEvent::NeedData { .. })) {
-            self.pending.gnu_long_name = None;
-            self.pending.count -= 1;
-        }
-        result
-    }
-
-    fn handle_gnu_long_link<'a>(
-        &mut self,
-        input: &'a [u8],
-        size: u64,
-        padded_size: u64,
-    ) -> Result<ParseEvent<'a>> {
-        // Check for duplicate
-        if self.pending.gnu_long_link.is_some() {
-            return Err(ParseError::DuplicateGnuLongLink);
-        }
-
-        // Check size limit
-        if size > self.limits.max_gnu_long_size {
-            return Err(ParseError::GnuLongTooLarge {
-                size,
-                limit: self.limits.max_gnu_long_size,
-            });
-        }
-
-        let total_size = HEADER_SIZE as u64 + padded_size;
-        if (input.len() as u64) < total_size {
-            return Ok(ParseEvent::NeedData {
-                min_bytes: total_size as usize,
-            });
-        }
-
-        // Extract content
-        let content_start = HEADER_SIZE;
-        let content_end = content_start + size as usize;
-        let mut data = input[content_start..content_end].to_vec();
-
-        // Strip trailing null
-        if data.last() == Some(&0) {
-            data.pop();
-        }
-
-        // Check path length
-        if data.len() > self.limits.max_path_len {
-            return Err(ParseError::PathTooLong {
-                len: data.len(),
-                limit: self.limits.max_path_len,
-            });
-        }
-
-        self.pending.gnu_long_link = Some(data);
-        self.pending.count += 1;
-
-        // Recurse to parse next header. Roll back on NeedData (see
-        // handle_gnu_long_name for rationale).
-        let result = self
-            .parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize));
-        if matches!(result, Ok(ParseEvent::NeedData { .. })) {
-            self.pending.gnu_long_link = None;
-            self.pending.count -= 1;
-        }
-        result
-    }
-
-    fn handle_pax_header<'a>(
-        &mut self,
-        input: &'a [u8],
-        size: u64,
-        padded_size: u64,
-    ) -> Result<ParseEvent<'a>> {
-        // Check for duplicate
-        if self.pending.pax_extensions.is_some() {
-            return Err(ParseError::DuplicatePaxHeader);
-        }
-
-        // Check size limit
-        if size > self.limits.max_pax_size {
-            return Err(ParseError::PaxTooLarge {
-                size,
-                limit: self.limits.max_pax_size,
-            });
-        }
-
-        let total_size = HEADER_SIZE as u64 + padded_size;
-        if (input.len() as u64) < total_size {
-            return Ok(ParseEvent::NeedData {
-                min_bytes: total_size as usize,
-            });
-        }
-
-        // Extract content
-        let content_start = HEADER_SIZE;
-        let content_end = content_start + size as usize;
-        let data = input[content_start..content_end].to_vec();
-
-        self.pending.pax_extensions = Some(data);
-        self.pending.count += 1;
-
-        // Recurse to parse next header. Roll back on NeedData (see
-        // handle_gnu_long_name for rationale).
-        let result = self
-            .parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize));
-        if matches!(result, Ok(ParseEvent::NeedData { .. })) {
-            self.pending.pax_extensions = None;
-            self.pending.count -= 1;
+            self.pending = saved;
         }
         result
     }
@@ -1050,7 +1003,7 @@ impl Parser {
         self.pending.clear();
 
         // Reject entries with empty paths
-        if path.is_empty() && self.limits.reject_empty_path {
+        if path.is_empty() && !self.allow_empty_path {
             return Err(ParseError::EmptyPath);
         }
 
