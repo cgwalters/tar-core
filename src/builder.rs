@@ -901,6 +901,14 @@ impl EntryBuilder {
         let sparse = self.sparse.take();
         let mut blocks = Vec::new();
 
+        // Pre-compute the PAX sparse map data (if applicable) so we can
+        // both adjust the header size and emit it after the main header
+        // without redundant work.
+        let pax_sparse_map_data: Option<Vec<u8>> = match (&sparse, self.mode) {
+            (Some(si), ExtensionMode::Pax) => Some(Self::build_sparse_map_data(si)),
+            _ => None,
+        };
+
         match self.mode {
             ExtensionMode::Gnu => {
                 // For GNU sparse, set entry type and write inline descriptors.
@@ -929,8 +937,11 @@ impl EntryBuilder {
                 // For PAX sparse v1.0, add sparse PAX extensions and adjust
                 // the header size to include the sparse map data prefix.
                 if let Some(ref si) = sparse {
-                    let map_data = Self::build_sparse_map_data(si);
-                    let map_padded = map_data.len().next_multiple_of(HEADER_SIZE);
+                    let map_padded = pax_sparse_map_data
+                        .as_ref()
+                        .unwrap()
+                        .len()
+                        .next_multiple_of(HEADER_SIZE);
 
                     // Add the map prefix size to the header's size field.
                     // The caller already set size() to on_disk content size;
@@ -940,8 +951,6 @@ impl EntryBuilder {
                         .size(current_size + map_padded as u64)
                         .expect("adjusted size fits");
 
-                    // Stash the map data for emission after the main header.
-                    // We encode it into the PAX builder.
                     let real_size_str = DecU64::new(si.real_size);
                     self.pax_mut().add(PAX_GNU_SPARSE_MAJOR, b"1");
                     self.pax_mut().add(PAX_GNU_SPARSE_MINOR, b"0");
@@ -985,10 +994,10 @@ impl EntryBuilder {
                 }
                 ExtensionMode::Pax => {
                     // PAX v1.0 sparse map data prefix (padded to 512 bytes).
-                    let map_data = Self::build_sparse_map_data(si);
+                    let map_data = pax_sparse_map_data.as_ref().unwrap();
                     let map_padded = map_data.len().next_multiple_of(HEADER_SIZE);
                     let mut buf = vec![0u8; map_padded];
-                    buf[..map_data.len()].copy_from_slice(&map_data);
+                    buf[..map_data.len()].copy_from_slice(map_data);
                     for chunk in buf.chunks_exact(HEADER_SIZE) {
                         blocks.push(*Header::from_bytes(
                             chunk.try_into().expect("chunks_exact guarantees size"),
@@ -2680,15 +2689,12 @@ mod tests {
                         sparse_map,
                         real_size: rs,
                         ..
-                    } if !map.is_empty() => {
+                    } => {
                         prop_assert_eq!(rs, real_size);
                         prop_assert_eq!(sparse_map.len(), map.len());
                         for (i, expected) in map.iter().enumerate() {
                             prop_assert_eq!(sparse_map[i], *expected);
                         }
-                    }
-                    ParseEvent::SparseEntry { sparse_map, .. } => {
-                        prop_assert!(sparse_map.is_empty());
                     }
                     other => {
                         return Err(proptest::test_runner::TestCaseError::fail(
@@ -2731,9 +2737,6 @@ mod tests {
                         for (i, expected) in map.iter().enumerate() {
                             prop_assert_eq!(sparse_map[i], *expected);
                         }
-                    }
-                    ParseEvent::Entry { .. } if map.is_empty() => {
-                        // Empty sparse map with PAX may parse as regular entry
                     }
                     other => {
                         return Err(proptest::test_runner::TestCaseError::fail(
