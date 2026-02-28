@@ -333,6 +333,16 @@ impl GnuSparseHeader {
             length: parse_numeric(&self.numbytes)?,
         })
     }
+
+    /// Write a [`SparseEntry`] into this descriptor.
+    ///
+    /// Uses octal ASCII if the values fit, otherwise GNU base-256 encoding.
+    pub fn set(&mut self, entry: &SparseEntry) {
+        encode_numeric(&mut self.offset, entry.offset)
+            .expect("u64 always fits in 12-byte numeric field");
+        encode_numeric(&mut self.numbytes, entry.length)
+            .expect("u64 always fits in 12-byte numeric field");
+    }
 }
 
 impl fmt::Debug for GnuSparseHeader {
@@ -541,6 +551,11 @@ impl GnuExtSparseHeader {
     #[must_use]
     pub fn is_extended(&self) -> bool {
         self.isextended == 1
+    }
+
+    /// Sets whether another extension block follows this one.
+    pub fn set_is_extended(&mut self, extended: bool) {
+        self.isextended = if extended { 1 } else { 0 };
     }
 }
 

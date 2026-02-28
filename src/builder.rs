@@ -18,8 +18,10 @@
 //! ```
 
 use crate::{
-    EntryType, Header, HeaderError, Result, UstarHeader, HEADER_SIZE, PAX_ATIME, PAX_CTIME,
-    PAX_GID, PAX_GNAME, PAX_LINKPATH, PAX_MTIME, PAX_PATH, PAX_SIZE, PAX_UID, PAX_UNAME,
+    EntryType, GnuExtSparseHeader, Header, HeaderError, Result, SparseEntry, UstarHeader,
+    HEADER_SIZE, PAX_ATIME, PAX_CTIME, PAX_GID, PAX_GNAME, PAX_GNU_SPARSE_MAJOR,
+    PAX_GNU_SPARSE_MINOR, PAX_GNU_SPARSE_NAME, PAX_GNU_SPARSE_REALSIZE, PAX_LINKPATH, PAX_MTIME,
+    PAX_PATH, PAX_SIZE, PAX_UID, PAX_UNAME,
 };
 
 /// Stack-allocated decimal formatter for u64.
@@ -269,6 +271,14 @@ impl HeaderBuilder {
     #[must_use]
     pub fn as_header(&self) -> &Header {
         &self.header
+    }
+
+    /// Get a mutable reference to the raw header.
+    ///
+    /// This is intended for direct field manipulation that the builder
+    /// doesn't expose (e.g. GNU sparse header fields).
+    pub fn as_header_mut(&mut self) -> &mut Header {
+        &mut self.header
     }
 
     /// Compute the checksum and return the final header.
@@ -543,6 +553,17 @@ pub struct EntryBuilder {
     pax: Option<PaxBuilder>,
     /// Extension mode preference.
     mode: ExtensionMode,
+    /// Sparse file map, if this is a sparse entry.
+    sparse: Option<SparseInfo>,
+}
+
+/// Sparse file metadata for the builder.
+#[derive(Clone)]
+struct SparseInfo {
+    /// The sparse data map: regions of real data within the logical file.
+    map: Vec<SparseEntry>,
+    /// Logical file size (the file appears this large to readers).
+    real_size: u64,
 }
 
 impl EntryBuilder {
@@ -557,6 +578,7 @@ impl EntryBuilder {
             long_link: None,
             pax: None,
             mode: ExtensionMode::Gnu,
+            sparse: None,
         }
     }
 
@@ -571,6 +593,7 @@ impl EntryBuilder {
             long_link: None,
             pax: None,
             mode: ExtensionMode::Pax,
+            sparse: None,
         }
     }
 
@@ -583,6 +606,7 @@ impl EntryBuilder {
             long_link: None,
             pax: None,
             mode,
+            sparse: None,
         }
     }
 
@@ -808,6 +832,29 @@ impl EntryBuilder {
         Ok(self)
     }
 
+    /// Mark this entry as a sparse file.
+    ///
+    /// The `sparse_map` describes which regions of the logical file contain
+    /// real data — gaps are implicitly zero-filled. The `real_size` is the
+    /// logical file size as seen by readers.
+    ///
+    /// The caller must also call [`size()`](Self::size) with the on-disk
+    /// content size (the sum of all sparse entry lengths).
+    ///
+    /// On [`finish()`](Self::finish), the builder emits format-appropriate
+    /// sparse metadata:
+    /// - **GNU mode**: Sets entry type to `GnuSparse`, writes inline
+    ///   descriptors and extension blocks, sets `realsize` in the GNU header.
+    /// - **PAX mode**: Adds `GNU.sparse.*` PAX extensions (v1.0 format)
+    ///   and emits the sparse map as a data prefix block.
+    pub fn sparse(&mut self, sparse_map: &[SparseEntry], real_size: u64) -> &mut Self {
+        self.sparse = Some(SparseInfo {
+            map: sparse_map.to_vec(),
+            real_size,
+        });
+        self
+    }
+
     /// Add a custom PAX extension record.
     ///
     /// This is useful for adding metadata that doesn't fit in standard
@@ -846,12 +893,28 @@ impl EntryBuilder {
     /// - For short paths: just the main header (1 block)
     /// - For GNU long paths: LongName header + data blocks + main header
     /// - For PAX: extended header + data blocks + main header
+    /// - For GNU sparse: above + extension blocks after the main header
+    /// - For PAX sparse: PAX header includes `GNU.sparse.*` keys, plus
+    ///   a sparse map data prefix block after the main header
     #[must_use]
     pub fn finish(&mut self) -> Vec<Header> {
+        let sparse = self.sparse.take();
         let mut blocks = Vec::new();
 
         match self.mode {
             ExtensionMode::Gnu => {
+                // For GNU sparse, set entry type and write inline descriptors.
+                if let Some(ref si) = sparse {
+                    self.header.entry_type(EntryType::GnuSparse);
+                    if let Some(gnu) = self.header.as_header_mut().try_as_gnu_mut() {
+                        gnu.set_real_size(si.real_size);
+                        for (i, entry) in si.map.iter().take(4).enumerate() {
+                            gnu.sparse[i].set(entry);
+                        }
+                        gnu.set_is_extended(si.map.len() > 4);
+                    }
+                }
+
                 // Emit GNU LongLink for long link targets first
                 if let Some(ref long_link) = self.long_link {
                     self.emit_gnu_long_entry(&mut blocks, EntryType::GnuLongLink, long_link);
@@ -863,6 +926,43 @@ impl EntryBuilder {
                 }
             }
             ExtensionMode::Pax => {
+                // For PAX sparse v1.0, add sparse PAX extensions and adjust
+                // the header size to include the sparse map data prefix.
+                if let Some(ref si) = sparse {
+                    let map_data = Self::build_sparse_map_data(si);
+                    let map_padded = map_data.len().next_multiple_of(HEADER_SIZE);
+
+                    // Add the map prefix size to the header's size field.
+                    // The caller already set size() to on_disk content size;
+                    // we add the padded map prefix on top.
+                    let current_size = self.header.as_header().entry_size().unwrap_or(0);
+                    self.header
+                        .size(current_size + map_padded as u64)
+                        .expect("adjusted size fits");
+
+                    // Stash the map data for emission after the main header.
+                    // We encode it into the PAX builder.
+                    let real_size_str = DecU64::new(si.real_size);
+                    self.pax_mut().add(PAX_GNU_SPARSE_MAJOR, b"1");
+                    self.pax_mut().add(PAX_GNU_SPARSE_MINOR, b"0");
+                    self.pax_mut()
+                        .add(PAX_GNU_SPARSE_REALSIZE, real_size_str.as_bytes());
+
+                    // The real path goes into GNU.sparse.name; the header
+                    // gets a synthetic path.
+                    let real_path = self
+                        .long_path
+                        .take()
+                        .unwrap_or_else(|| self.header.as_header().path_bytes().to_vec());
+                    self.pax_mut().add(PAX_GNU_SPARSE_NAME, &real_path);
+
+                    // Set a synthetic path in the header (following Go's convention).
+                    let synthetic = b"GNUSparseFile.0/placeholder";
+                    self.header
+                        .path(synthetic)
+                        .expect("synthetic sparse path fits");
+                }
+
                 // Build PAX data with long path/link if needed
                 let pax_data = self.build_pax_data();
                 if !pax_data.is_empty() {
@@ -871,9 +971,32 @@ impl EntryBuilder {
             }
         }
 
-        // Emit the main header
+        // Emit the main header (recomputes checksum)
         let main_header = self.header.finish();
         blocks.push(main_header);
+
+        // Emit format-specific sparse metadata after the main header.
+        if let Some(ref si) = sparse {
+            match self.mode {
+                ExtensionMode::Gnu => {
+                    // GNU sparse extension blocks for entries beyond the
+                    // first 4 inline descriptors.
+                    self.emit_gnu_sparse_ext_blocks(&mut blocks, si);
+                }
+                ExtensionMode::Pax => {
+                    // PAX v1.0 sparse map data prefix (padded to 512 bytes).
+                    let map_data = Self::build_sparse_map_data(si);
+                    let map_padded = map_data.len().next_multiple_of(HEADER_SIZE);
+                    let mut buf = vec![0u8; map_padded];
+                    buf[..map_data.len()].copy_from_slice(&map_data);
+                    for chunk in buf.chunks_exact(HEADER_SIZE) {
+                        blocks.push(*Header::from_bytes(
+                            chunk.try_into().expect("chunks_exact guarantees size"),
+                        ));
+                    }
+                }
+            }
+        }
 
         blocks
     }
@@ -987,6 +1110,44 @@ impl EntryBuilder {
         name.extend_from_slice(truncated_base);
 
         name
+    }
+
+    /// Build the PAX v1.0 sparse map data prefix.
+    ///
+    /// Format: `<count>\n<offset>\n<length>\n...` (not yet padded).
+    fn build_sparse_map_data(si: &SparseInfo) -> Vec<u8> {
+        let mut data = format!("{}\n", si.map.len());
+        for entry in &si.map {
+            data.push_str(&format!("{}\n{}\n", entry.offset, entry.length));
+        }
+        data.into_bytes()
+    }
+
+    /// Emit GNU sparse extension blocks for entries beyond the first 4.
+    fn emit_gnu_sparse_ext_blocks(&self, blocks: &mut Vec<Header>, si: &SparseInfo) {
+        if si.map.len() <= 4 {
+            return;
+        }
+
+        let remaining = &si.map[4..];
+        let chunks: Vec<&[SparseEntry]> = remaining.chunks(21).collect();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_last = i == chunks.len() - 1;
+            let mut ext = GnuExtSparseHeader::default();
+            for (j, entry) in chunk.iter().enumerate() {
+                ext.sparse[j].set(entry);
+            }
+            ext.set_is_extended(!is_last);
+
+            // Convert the extension block to a Header-sized block.
+            let ext_bytes = zerocopy::IntoBytes::as_bytes(&ext);
+            blocks.push(*Header::from_bytes(
+                ext_bytes
+                    .try_into()
+                    .expect("GnuExtSparseHeader is 512 bytes"),
+            ));
+        }
     }
 }
 
