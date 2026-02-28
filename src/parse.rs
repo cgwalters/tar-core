@@ -121,6 +121,12 @@ pub struct Limits {
     ///
     /// Default: `true`.
     pub strict: bool,
+
+    /// When true, entries with an empty path (after applying all overrides)
+    /// cause an [`ParseError::EmptyPath`] error.
+    ///
+    /// Default: `true`.
+    pub reject_empty_path: bool,
 }
 
 impl Default for Limits {
@@ -131,6 +137,7 @@ impl Default for Limits {
             max_gnu_long_size: 4096,
             max_pending_entries: 16,
             strict: true,
+            reject_empty_path: true,
         }
     }
 }
@@ -154,6 +161,7 @@ impl Limits {
             max_gnu_long_size: u64::MAX,
             max_pending_entries: usize::MAX,
             strict: false,
+            reject_empty_path: false,
         }
     }
 
@@ -169,6 +177,7 @@ impl Limits {
             max_gnu_long_size: 1024,
             max_pending_entries: 8,
             strict: true,
+            reject_empty_path: true,
         }
     }
 }
@@ -262,7 +271,7 @@ pub enum ParseError {
     EmptyPath,
 
     /// Entry size in header is invalid (e.g., overflow when computing padded size).
-    #[error("invalid entry size: {0}")]
+    #[error("entry size overflow: {0}")]
     InvalidSize(u64),
 
     /// Unexpected EOF while reading entry content or padding.
@@ -534,8 +543,6 @@ pub struct Parser {
     limits: Limits,
     state: State,
     pending: PendingMetadata,
-    /// Count of consecutive zero blocks seen.
-    zero_blocks: u8,
 }
 
 impl Parser {
@@ -546,7 +553,6 @@ impl Parser {
             limits,
             state: State::ReadHeader,
             pending: PendingMetadata::default(),
-            zero_blocks: 0,
         }
     }
 
@@ -651,22 +657,16 @@ impl Parser {
             });
         }
 
-        // Check for zero block (end of archive marker)
+        // Check for zero block (end of archive marker).
+        //
+        // NB: No state mutation happens before a potential NeedData return,
+        // so the caller can safely retry with more data.
         let header_bytes: &[u8; HEADER_SIZE] = input[..HEADER_SIZE]
             .try_into()
             .expect("already checked input.len() >= HEADER_SIZE");
         if header_bytes.iter().all(|&b| b == 0) {
-            self.zero_blocks += 1;
-            if self.zero_blocks >= 2 {
-                self.state = State::Done;
-                if !self.pending.is_empty() {
-                    return Err(ParseError::OrphanedMetadata);
-                }
-                return Ok(ParseEvent::End {
-                    consumed: HEADER_SIZE,
-                });
-            }
-            // First zero block - need to check for second
+            // Need a second block to decide whether this is end-of-archive
+            // or a stray zero block.
             if input.len() < 2 * HEADER_SIZE {
                 return Ok(ParseEvent::NeedData {
                     min_bytes: 2 * HEADER_SIZE,
@@ -683,15 +683,12 @@ impl Parser {
                     consumed: 2 * HEADER_SIZE,
                 });
             }
-            // Not end of archive - continue with second block as header
-            // (this handles archives with single zero blocks mid-stream)
-            self.zero_blocks = 0;
+            // Not end of archive — single stray zero block; skip it and
+            // continue with the next block as a header.
             return self
                 .parse_header(&input[HEADER_SIZE..])
                 .map(|e| e.add_consumed(HEADER_SIZE));
         }
-
-        self.zero_blocks = 0;
 
         // Check pending entry limit
         if self.pending.count > self.limits.max_pending_entries {
@@ -782,9 +779,17 @@ impl Parser {
         self.pending.gnu_long_name = Some(data);
         self.pending.count += 1;
 
-        // Recurse to parse next header
-        self.parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize))
+        // Recurse to parse next header. If the recursive call returns
+        // NeedData, roll back the pending state so the caller can retry
+        // with more data (re-parsing this extension header from scratch).
+        let result = self
+            .parse_header(&input[total_size as usize..])
+            .map(|e| e.add_consumed(total_size as usize));
+        if matches!(result, Ok(ParseEvent::NeedData { .. })) {
+            self.pending.gnu_long_name = None;
+            self.pending.count -= 1;
+        }
+        result
     }
 
     fn handle_gnu_long_link<'a>(
@@ -834,9 +839,16 @@ impl Parser {
         self.pending.gnu_long_link = Some(data);
         self.pending.count += 1;
 
-        // Recurse to parse next header
-        self.parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize))
+        // Recurse to parse next header. Roll back on NeedData (see
+        // handle_gnu_long_name for rationale).
+        let result = self
+            .parse_header(&input[total_size as usize..])
+            .map(|e| e.add_consumed(total_size as usize));
+        if matches!(result, Ok(ParseEvent::NeedData { .. })) {
+            self.pending.gnu_long_link = None;
+            self.pending.count -= 1;
+        }
+        result
     }
 
     fn handle_pax_header<'a>(
@@ -873,9 +885,16 @@ impl Parser {
         self.pending.pax_extensions = Some(data);
         self.pending.count += 1;
 
-        // Recurse to parse next header
-        self.parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize))
+        // Recurse to parse next header. Roll back on NeedData (see
+        // handle_gnu_long_name for rationale).
+        let result = self
+            .parse_header(&input[total_size as usize..])
+            .map(|e| e.add_consumed(total_size as usize));
+        if matches!(result, Ok(ParseEvent::NeedData { .. })) {
+            self.pending.pax_extensions = None;
+            self.pending.count -= 1;
+        }
+        result
     }
 
     fn emit_entry<'a>(&mut self, header: &'a Header, size: u64) -> Result<ParseEvent<'a>> {
@@ -1031,7 +1050,7 @@ impl Parser {
         self.pending.clear();
 
         // Reject entries with empty paths
-        if path.is_empty() {
+        if path.is_empty() && self.limits.reject_empty_path {
             return Err(ParseError::EmptyPath);
         }
 
