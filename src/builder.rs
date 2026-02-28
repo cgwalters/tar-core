@@ -2114,9 +2114,536 @@ mod tests {
         assert_eq!(header.gid().unwrap(), large_uid);
     }
 
+    // =========================================================================
+    // Sparse EntryBuilder Tests
+    // =========================================================================
+
+    use crate::parse::{Limits, ParseEvent, Parser};
+    use crate::SparseEntry;
+    use zerocopy::FromBytes;
+
+    #[test]
+    fn test_entry_builder_gnu_sparse_basic() {
+        let sparse_map = [
+            SparseEntry {
+                offset: 0,
+                length: 100,
+            },
+            SparseEntry {
+                offset: 1000,
+                length: 200,
+            },
+        ];
+        let on_disk: u64 = 300;
+        let real_size: u64 = 1200;
+
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"sparse.bin")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let blocks = builder.finish();
+        assert_eq!(blocks.len(), 1, "2 inline entries => no extension blocks");
+
+        let header = &blocks[0];
+        assert_eq!(header.entry_type(), EntryType::GnuSparse);
+        header.verify_checksum().unwrap();
+
+        let gnu = header.try_as_gnu().unwrap();
+        assert_eq!(gnu.real_size().unwrap(), real_size);
+        assert!(!gnu.is_extended());
+
+        let s0 = gnu.sparse[0].to_sparse_entry().unwrap();
+        assert_eq!(s0, sparse_map[0]);
+        let s1 = gnu.sparse[1].to_sparse_entry().unwrap();
+        assert_eq!(s1, sparse_map[1]);
+        assert!(gnu.sparse[2].is_empty());
+    }
+
+    #[test]
+    fn test_entry_builder_gnu_sparse_four_inline() {
+        let sparse_map = [
+            SparseEntry {
+                offset: 0,
+                length: 50,
+            },
+            SparseEntry {
+                offset: 100,
+                length: 50,
+            },
+            SparseEntry {
+                offset: 200,
+                length: 50,
+            },
+            SparseEntry {
+                offset: 300,
+                length: 50,
+            },
+        ];
+        let on_disk: u64 = 200;
+        let real_size: u64 = 350;
+
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"sparse4.bin")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let blocks = builder.finish();
+        assert_eq!(blocks.len(), 1, "exactly 4 entries fit inline");
+
+        let header = &blocks[0];
+        assert_eq!(header.entry_type(), EntryType::GnuSparse);
+        header.verify_checksum().unwrap();
+
+        let gnu = header.try_as_gnu().unwrap();
+        assert_eq!(gnu.real_size().unwrap(), real_size);
+        assert!(!gnu.is_extended());
+
+        for (i, expected) in sparse_map.iter().enumerate() {
+            assert_eq!(gnu.sparse[i].to_sparse_entry().unwrap(), *expected);
+        }
+    }
+
+    #[test]
+    fn test_entry_builder_gnu_sparse_with_extensions() {
+        // 6 entries: 4 inline + 2 in one extension block
+        let sparse_map: Vec<SparseEntry> = (0..6)
+            .map(|i| SparseEntry {
+                offset: i * 1000,
+                length: 100,
+            })
+            .collect();
+        let on_disk: u64 = 600;
+        let real_size: u64 = 5100;
+
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"sparse_ext.bin")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let blocks = builder.finish();
+        assert_eq!(blocks.len(), 2, "main header + 1 extension block");
+
+        // Main header
+        let header = &blocks[0];
+        assert_eq!(header.entry_type(), EntryType::GnuSparse);
+        header.verify_checksum().unwrap();
+        let gnu = header.try_as_gnu().unwrap();
+        assert!(gnu.is_extended(), "more entries follow");
+        assert_eq!(gnu.real_size().unwrap(), real_size);
+
+        for (i, expected) in sparse_map.iter().enumerate().take(4) {
+            assert_eq!(gnu.sparse[i].to_sparse_entry().unwrap(), *expected);
+        }
+
+        // Extension block
+        let ext = GnuExtSparseHeader::ref_from_bytes(blocks[1].as_bytes()).unwrap();
+        assert!(!ext.is_extended(), "last extension block");
+        for i in 0..2 {
+            assert_eq!(ext.sparse[i].to_sparse_entry().unwrap(), sparse_map[4 + i]);
+        }
+        assert!(ext.sparse[2].is_empty());
+    }
+
+    #[test]
+    fn test_entry_builder_gnu_sparse_many_extensions() {
+        // 28 entries: 4 inline + 21 in ext1 + 3 in ext2
+        let sparse_map: Vec<SparseEntry> = (0..28)
+            .map(|i| SparseEntry {
+                offset: i * 500,
+                length: 50,
+            })
+            .collect();
+        let on_disk: u64 = 28 * 50;
+        let real_size: u64 = 27 * 500 + 50;
+
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"sparse_many.bin")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let blocks = builder.finish();
+        assert_eq!(blocks.len(), 3, "main + 2 extension blocks");
+
+        let gnu = blocks[0].try_as_gnu().unwrap();
+        assert!(gnu.is_extended());
+
+        let ext1 = GnuExtSparseHeader::ref_from_bytes(blocks[1].as_bytes()).unwrap();
+        assert!(ext1.is_extended(), "ext1 chains to ext2");
+        for i in 0..21 {
+            assert_eq!(ext1.sparse[i].to_sparse_entry().unwrap(), sparse_map[4 + i]);
+        }
+
+        let ext2 = GnuExtSparseHeader::ref_from_bytes(blocks[2].as_bytes()).unwrap();
+        assert!(!ext2.is_extended(), "ext2 is last");
+        for i in 0..3 {
+            assert_eq!(
+                ext2.sparse[i].to_sparse_entry().unwrap(),
+                sparse_map[25 + i]
+            );
+        }
+        assert!(ext2.sparse[3].is_empty());
+    }
+
+    #[test]
+    fn test_entry_builder_pax_sparse_basic() {
+        let sparse_map = [
+            SparseEntry {
+                offset: 0,
+                length: 100,
+            },
+            SparseEntry {
+                offset: 2000,
+                length: 300,
+            },
+        ];
+        let on_disk: u64 = 400;
+        let real_size: u64 = 2300;
+
+        let mut builder = EntryBuilder::new_ustar();
+        builder
+            .path(b"pax_sparse.dat")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let blocks = builder.finish();
+
+        // First block is a PAX XHeader
+        assert_eq!(blocks[0].entry_type(), EntryType::XHeader);
+        blocks[0].verify_checksum().unwrap();
+
+        // Parse PAX data to verify sparse keys
+        let pax_size = blocks[0].entry_size().unwrap() as usize;
+        let pax_data_blocks = pax_size.div_ceil(HEADER_SIZE);
+        let pax_data: Vec<u8> = blocks[1..1 + pax_data_blocks]
+            .iter()
+            .flat_map(|b| b.as_bytes())
+            .copied()
+            .collect();
+        let pax_str = std::str::from_utf8(&pax_data[..pax_size]).unwrap();
+
+        assert!(pax_str.contains("GNU.sparse.major=1\n"));
+        assert!(pax_str.contains("GNU.sparse.minor=0\n"));
+        assert!(pax_str.contains(&format!("GNU.sparse.realsize={real_size}\n")));
+        assert!(pax_str.contains("GNU.sparse.name=pax_sparse.dat\n"));
+
+        // Main header should have a synthetic path
+        let main_idx = 1 + pax_data_blocks;
+        let main = &blocks[main_idx];
+        assert!(
+            main.path_bytes().starts_with(b"GNUSparseFile"),
+            "synthetic path should start with GNUSparseFile, got {:?}",
+            String::from_utf8_lossy(main.path_bytes())
+        );
+        main.verify_checksum().unwrap();
+
+        // After main header, there's a sparse map data prefix block
+        assert!(blocks.len() > main_idx + 1, "should have map data prefix");
+        let map_block = blocks[main_idx + 1].as_bytes();
+        let map_str = std::str::from_utf8(map_block).unwrap();
+        // Format: "<count>\n<offset>\n<length>\n..."
+        assert!(
+            map_str.starts_with("2\n"),
+            "map prefix starts with entry count"
+        );
+        assert!(map_str.contains("0\n100\n"));
+        assert!(map_str.contains("2000\n300\n"));
+    }
+
+    #[test]
+    fn test_entry_builder_gnu_sparse_with_long_path() {
+        let long_path = "d/".repeat(60) + "sparse.bin"; // >100 bytes
+        assert!(long_path.len() > 100);
+
+        let sparse_map: Vec<SparseEntry> = (0..6)
+            .map(|i| SparseEntry {
+                offset: i * 1000,
+                length: 100,
+            })
+            .collect();
+        let on_disk: u64 = 600;
+        let real_size: u64 = 5100;
+
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(long_path.as_bytes())
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let blocks = builder.finish();
+
+        // LongName blocks come first
+        assert_eq!(blocks[0].entry_type(), EntryType::GnuLongName);
+        blocks[0].verify_checksum().unwrap();
+
+        // Find the main header (GnuSparse type)
+        let main_idx = blocks
+            .iter()
+            .position(|b| b.entry_type() == EntryType::GnuSparse)
+            .expect("should have GnuSparse header");
+
+        // LongName header + data should precede it
+        assert!(main_idx >= 2, "LongName header + data before main");
+
+        // Extension blocks should follow the main header
+        let gnu = blocks[main_idx].try_as_gnu().unwrap();
+        assert!(gnu.is_extended());
+
+        // Remaining blocks after main header should be extension blocks
+        let ext_blocks = blocks.len() - main_idx - 1;
+        assert!(ext_blocks >= 1, "should have extension block(s) after main");
+    }
+
+    // =========================================================================
+    // Sparse roundtrip tests (build → parse → verify)
+    // =========================================================================
+
+    /// Helper: build a complete archive from builder output + on-disk data.
+    fn build_archive(builder: &mut EntryBuilder, on_disk_size: u64) -> Vec<u8> {
+        let mut archive = Vec::new();
+        let header_bytes = builder.finish_bytes();
+        archive.extend_from_slice(&header_bytes);
+        // Content data (zeros for testing), padded to 512
+        archive.extend(vec![0u8; on_disk_size.next_multiple_of(512) as usize]);
+        // End-of-archive marker (two zero blocks)
+        archive.extend(vec![0u8; 1024]);
+        archive
+    }
+
+    /// Helper: parse an archive and extract the sparse event.
+    fn parse_sparse_event(archive: &[u8]) -> (Vec<SparseEntry>, u64, Vec<u8>) {
+        let mut parser = Parser::new(Limits::default());
+        match parser.parse(archive).unwrap() {
+            ParseEvent::SparseEntry {
+                sparse_map,
+                real_size,
+                entry,
+                ..
+            } => (sparse_map, real_size, entry.path.to_vec()),
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_roundtrip_gnu_basic() {
+        let sparse_map = vec![
+            SparseEntry {
+                offset: 0,
+                length: 100,
+            },
+            SparseEntry {
+                offset: 5000,
+                length: 200,
+            },
+        ];
+        let on_disk: u64 = 300;
+        let real_size: u64 = 5200;
+
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"rt_gnu.bin")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let archive = build_archive(&mut builder, on_disk);
+        let (parsed_map, parsed_rs, parsed_path) = parse_sparse_event(&archive);
+
+        assert_eq!(parsed_path, b"rt_gnu.bin");
+        assert_eq!(parsed_rs, real_size);
+        assert_eq!(parsed_map, sparse_map);
+    }
+
+    #[test]
+    fn test_sparse_roundtrip_gnu_extended() {
+        let sparse_map: Vec<SparseEntry> = (0..6)
+            .map(|i| SparseEntry {
+                offset: i * 2000,
+                length: 100,
+            })
+            .collect();
+        let on_disk: u64 = 600;
+        let real_size: u64 = 10100;
+
+        let mut builder = EntryBuilder::new_gnu();
+        builder
+            .path(b"rt_gnu_ext.bin")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let archive = build_archive(&mut builder, on_disk);
+        let (parsed_map, parsed_rs, _) = parse_sparse_event(&archive);
+
+        assert_eq!(parsed_rs, real_size);
+        assert_eq!(parsed_map, sparse_map);
+    }
+
+    #[test]
+    fn test_sparse_roundtrip_pax_basic() {
+        let sparse_map = vec![
+            SparseEntry {
+                offset: 0,
+                length: 100,
+            },
+            SparseEntry {
+                offset: 3000,
+                length: 400,
+            },
+        ];
+        let on_disk: u64 = 500;
+        let real_size: u64 = 3400;
+
+        let mut builder = EntryBuilder::new_ustar();
+        builder
+            .path(b"rt_pax.dat")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let archive = build_archive(&mut builder, on_disk);
+        let (parsed_map, parsed_rs, parsed_path) = parse_sparse_event(&archive);
+
+        assert_eq!(parsed_path, b"rt_pax.dat");
+        assert_eq!(parsed_rs, real_size);
+        assert_eq!(parsed_map, sparse_map);
+    }
+
+    #[test]
+    fn test_sparse_roundtrip_pax_many_entries() {
+        let sparse_map: Vec<SparseEntry> = (0..10)
+            .map(|i| SparseEntry {
+                offset: i * 1000,
+                length: 50,
+            })
+            .collect();
+        let on_disk: u64 = 500;
+        let real_size: u64 = 9050;
+
+        let mut builder = EntryBuilder::new_ustar();
+        builder
+            .path(b"rt_pax_many.dat")
+            .mode(0o644)
+            .unwrap()
+            .size(on_disk)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap()
+            .sparse(&sparse_map, real_size);
+
+        let archive = build_archive(&mut builder, on_disk);
+        let (parsed_map, parsed_rs, parsed_path) = parse_sparse_event(&archive);
+
+        assert_eq!(parsed_path, b"rt_pax_many.dat");
+        assert_eq!(parsed_rs, real_size);
+        assert_eq!(parsed_map, sparse_map);
+    }
+
     mod proptest_tests {
         use super::*;
         use proptest::prelude::*;
+
+        /// Strategy for generating a sparse map with non-overlapping entries.
+        fn sparse_map_strategy(max_entries: usize) -> impl Strategy<Value = Vec<SparseEntry>> {
+            proptest::collection::vec((0u64..0x10_000, 1u64..0x1000), 0..=max_entries).prop_map(
+                |raw| {
+                    let mut entries = Vec::new();
+                    let mut cursor = 0u64;
+                    for (gap, length) in raw {
+                        let offset = cursor.saturating_add(gap);
+                        entries.push(SparseEntry { offset, length });
+                        cursor = offset.saturating_add(length);
+                    }
+                    entries
+                },
+            )
+        }
 
         proptest! {
             #[test]
@@ -2125,6 +2652,94 @@ mod tests {
                 let s = core::str::from_utf8(d.as_bytes()).unwrap();
                 let parsed: u64 = s.parse().unwrap();
                 prop_assert_eq!(parsed, value);
+            }
+
+            #[test]
+            fn test_sparse_builder_roundtrip_gnu(
+                map in sparse_map_strategy(30),
+            ) {
+                let on_disk: u64 = map.iter().map(|e| e.length).sum();
+                let real_size = map.last().map(|e| e.offset + e.length).unwrap_or(0);
+
+                let mut builder = EntryBuilder::new_gnu();
+                builder
+                    .path(b"proptest_gnu.bin")
+                    .mode(0o644).unwrap()
+                    .size(on_disk).unwrap()
+                    .mtime(0).unwrap()
+                    .uid(0).unwrap()
+                    .gid(0).unwrap()
+                    .sparse(&map, real_size);
+
+                let archive = build_archive(&mut builder, on_disk);
+                let mut parser = Parser::new(Limits::default());
+                let event = parser.parse(&archive).unwrap();
+
+                match event {
+                    ParseEvent::SparseEntry {
+                        sparse_map,
+                        real_size: rs,
+                        ..
+                    } if !map.is_empty() => {
+                        prop_assert_eq!(rs, real_size);
+                        prop_assert_eq!(sparse_map.len(), map.len());
+                        for (i, expected) in map.iter().enumerate() {
+                            prop_assert_eq!(sparse_map[i], *expected);
+                        }
+                    }
+                    ParseEvent::SparseEntry { sparse_map, .. } => {
+                        prop_assert!(sparse_map.is_empty());
+                    }
+                    other => {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            format!("Expected SparseEntry, got {other:?}")));
+                    }
+                }
+            }
+
+            #[test]
+            fn test_sparse_builder_roundtrip_pax(
+                map in sparse_map_strategy(20),
+            ) {
+                let on_disk: u64 = map.iter().map(|e| e.length).sum();
+                let real_size = map.last().map(|e| e.offset + e.length).unwrap_or(0);
+
+                let mut builder = EntryBuilder::new_ustar();
+                builder
+                    .path(b"proptest_pax.dat")
+                    .mode(0o644).unwrap()
+                    .size(on_disk).unwrap()
+                    .mtime(0).unwrap()
+                    .uid(0).unwrap()
+                    .gid(0).unwrap()
+                    .sparse(&map, real_size);
+
+                let archive = build_archive(&mut builder, on_disk);
+                let mut parser = Parser::new(Limits::default());
+                let event = parser.parse(&archive).unwrap();
+
+                match event {
+                    ParseEvent::SparseEntry {
+                        sparse_map,
+                        real_size: rs,
+                        entry,
+                        ..
+                    } => {
+                        prop_assert_eq!(&entry.path[..], b"proptest_pax.dat");
+                        prop_assert_eq!(rs, real_size);
+                        prop_assert_eq!(sparse_map.len(), map.len());
+                        for (i, expected) in map.iter().enumerate() {
+                            prop_assert_eq!(sparse_map[i], *expected);
+                        }
+                    }
+                    ParseEvent::Entry { .. } if map.is_empty() => {
+                        // Empty sparse map with PAX may parse as regular entry
+                    }
+                    other => {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            format!("Expected SparseEntry, got {other:?}")));
+                    }
+                }
             }
         }
     }
