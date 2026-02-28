@@ -206,12 +206,9 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(content, parsed_content, "content mismatch");
     }
 
-    // Advance past content and verify End
+    // Skip past content + padding
     let padded = content.len().next_multiple_of(HEADER_SIZE);
     offset += padded;
-    parser
-        .advance_content(parsed_entry.size)
-        .expect("advance_content failed");
 
     match parser.parse(&archive[offset..]) {
         Ok(ParseEvent::End { .. }) => {}

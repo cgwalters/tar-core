@@ -314,9 +314,6 @@ fn parse_with_tar_core(data: &[u8]) -> Vec<EntryParams> {
                 let content = data[offset..offset + size].to_vec();
                 let padded = size.next_multiple_of(HEADER_SIZE);
                 offset += padded;
-                parser
-                    .advance_content(size as u64)
-                    .expect("advance should succeed");
 
                 results.push(EntryParams {
                     path,

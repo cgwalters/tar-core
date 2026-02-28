@@ -299,10 +299,9 @@ pub enum ParseEvent<'a> {
     /// The entry contains resolved metadata (path, link target, etc.) with
     /// GNU long name/link and PAX extensions applied.
     ///
-    /// After this event, the caller must:
-    /// 1. Read/skip `entry.size` bytes of content from the input
-    /// 2. Read/skip padding bytes to reach the next 512-byte boundary
-    /// 3. Call `advance_content(entry.size)` to update parser state
+    /// After this event, the caller must read or skip `entry.size` bytes
+    /// of content plus padding to the next 512-byte boundary before
+    /// calling `parse()` again with the next header bytes.
     Entry {
         /// Number of bytes consumed from the input for this entry's header(s).
         consumed: usize,
@@ -455,9 +454,6 @@ impl<'a> ParsedEntry<'a> {
 enum State {
     /// Waiting to read a header.
     ReadHeader,
-    /// Waiting to read content (after emitting Entry event).
-    /// The u64 is the padded size we're waiting for.
-    ReadContent { padded_size: u64 },
     /// Archive is complete.
     Done,
 }
@@ -500,15 +496,13 @@ impl PendingMetadata {
 /// It does not perform any I/O itself - the caller is responsible for
 /// providing data and handling the parsed events.
 ///
-/// # State Machine
+/// # Usage
 ///
-/// The parser cycles through states:
-///
-/// 1. **ReadHeader**: Waiting for a 512-byte header block
-/// 2. **ReadContent**: Waiting for content + padding bytes
-/// 3. **Done**: Archive complete
-///
-/// # Usage Pattern
+/// The caller feeds header bytes to `parse()`. On `Entry`, the caller
+/// reads/skips `entry.size` bytes of content (plus padding to the next
+/// 512-byte boundary) from its own I/O source, then calls `parse()`
+/// again with the next header bytes. The parser does not see or track
+/// content bytes.
 ///
 /// ```ignore
 /// let mut parser = Parser::new(Limits::default());
@@ -516,10 +510,8 @@ impl PendingMetadata {
 /// let mut filled = 0;
 ///
 /// loop {
-///     // Try to parse from current buffer
 ///     match parser.parse(&buf[..filled]) {
 ///         Ok(ParseEvent::NeedData { min_bytes }) => {
-///             // Need more data - read into buffer
 ///             let n = read_more(&mut buf[filled..])?;
 ///             filled += n;
 ///             if n == 0 && filled < min_bytes {
@@ -528,9 +520,9 @@ impl PendingMetadata {
 ///         }
 ///         Ok(ParseEvent::Entry { consumed, entry }) => {
 ///             process_entry(&entry);
-///             let content_size = entry.size;
-///             // ... handle content ...
-///             parser.advance_content(content_size)?;
+///             // Read/skip entry.size bytes + padding, then clear buf
+///             skip_content(entry.padded_size())?;
+///             filled = 0;
 ///         }
 ///         Ok(ParseEvent::End { .. }) => break,
 ///         Err(e) => return Err(e),
@@ -595,65 +587,13 @@ impl Parser {
     /// - `Entry { consumed, entry }`: A complete entry header; caller must handle content
     /// - `End { consumed }`: Archive is complete
     ///
-    /// # Content Handling
-    ///
-    /// After receiving an `Entry` event, the caller is responsible for:
-    /// 1. Processing `entry.size` bytes of content from their buffer
-    /// 2. Skipping padding to reach the next 512-byte boundary
-    /// 3. Calling `advance_content(entry.size)` to transition the parser
-    ///
-    /// The content bytes are NOT consumed by this method - they remain in
-    /// the caller's buffer for processing.
+    /// After receiving an `Entry` event, the caller is responsible for
+    /// reading or skipping `entry.size` bytes of content (plus padding to
+    /// the next 512-byte boundary) before calling `parse()` again.
     pub fn parse<'a>(&mut self, input: &'a [u8]) -> Result<ParseEvent<'a>> {
         match self.state {
             State::Done => Ok(ParseEvent::End { consumed: 0 }),
-
-            State::ReadContent { padded_size } => {
-                // Caller hasn't called advance_content yet
-                // Return NeedData with the remaining content size
-                Ok(ParseEvent::NeedData {
-                    min_bytes: padded_size as usize,
-                })
-            }
-
             State::ReadHeader => self.parse_header(input),
-        }
-    }
-
-    /// Advance past entry content after processing.
-    ///
-    /// Call this after handling an `Entry` event and consuming/skipping
-    /// the entry's content and padding bytes.
-    ///
-    /// # Arguments
-    ///
-    /// * `content_size` - The `entry.size` from the Entry event
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the parser is not in the ReadContent state.
-    pub fn advance_content(&mut self, content_size: u64) -> Result<()> {
-        match self.state {
-            State::ReadContent { padded_size } => {
-                // Verify the caller is advancing the expected amount
-                let expected_padded = content_size.next_multiple_of(HEADER_SIZE as u64);
-                debug_assert_eq!(
-                    expected_padded, padded_size,
-                    "advance_content called with size {content_size} but parser expected padded size {padded_size}"
-                );
-                self.state = State::ReadHeader;
-                Ok(())
-            }
-            State::ReadHeader | State::Done => {
-                // Not in content state - this may happen if caller skips content
-                // for empty entries, which is fine
-                debug_assert!(
-                    content_size == 0,
-                    "advance_content called in {:?} state with non-zero size {content_size}",
-                    self.state
-                );
-                Ok(())
-            }
         }
     }
 
@@ -1015,12 +955,6 @@ impl Parser {
             });
         }
 
-        // Update state to expect content
-        let content_padded = entry_size.next_multiple_of(HEADER_SIZE as u64);
-        self.state = State::ReadContent {
-            padded_size: content_padded,
-        };
-
         let entry = ParsedEntry {
             header,
             entry_type: header.entry_type(),
@@ -1156,9 +1090,6 @@ mod tests {
             other => panic!("Expected Entry, got {:?}", other),
         }
 
-        // Advance past content (size 0, so padded_size is also 0)
-        parser.advance_content(0).unwrap();
-
         // Now parse end
         let event = parser.parse(&data[512..]).unwrap();
         assert!(matches!(event, ParseEvent::End { consumed: 1024 }));
@@ -1202,10 +1133,8 @@ mod tests {
             other => panic!("Expected Entry, got {:?}", other),
         }
 
-        // Content starts at data[512], size 5, padded to 512
-        // Caller would read data[512..517] for content
-        // Then call advance_content(5) to move past
-        parser.advance_content(5).unwrap();
+        // Content at data[512..517], padded to 512.
+        // Caller skips past content + padding, then parses the next header.
 
         // Parse end (zero blocks at 1024..2048)
         let event = parser.parse(&data[1024..]).unwrap();
@@ -1406,9 +1335,7 @@ mod tests {
             other => panic!("Expected Entry, got {:?}", other),
         };
 
-        parser.advance_content(5).unwrap();
-
-        // Parse end
+        // Parse end (skip past content + padding)
         let remaining = &archive[consumed + 512..];
         let event = parser.parse(remaining).unwrap();
         assert!(matches!(event, ParseEvent::End { .. }));
@@ -1445,8 +1372,6 @@ mod tests {
             }
             other => panic!("Expected Entry, got {:?}", other),
         };
-
-        parser.advance_content(0).unwrap();
 
         let remaining = &archive[consumed..];
         let event = parser.parse(remaining).unwrap();
@@ -1824,9 +1749,8 @@ mod tests {
             }
             other => panic!("Expected Entry, got {:?}", other),
         };
-        parser.advance_content(5).unwrap();
 
-        // Parse second entry
+        // Parse second entry (skip past first entry's content + padding)
         let offset = consumed1 + 512;
         let event2 = parser.parse(&archive[offset..]).unwrap();
         let consumed2 = match &event2 {
@@ -1837,9 +1761,8 @@ mod tests {
             }
             other => panic!("Expected Entry, got {:?}", other),
         };
-        parser.advance_content(5).unwrap();
 
-        // Parse end
+        // Parse end (skip past second entry's content + padding)
         let final_offset = offset + consumed2 + 512;
         let event3 = parser.parse(&archive[final_offset..]).unwrap();
         assert!(matches!(event3, ParseEvent::End { .. }));
@@ -2057,8 +1980,6 @@ mod tests {
                 // Path should be from header
                 assert_eq!(entry.path_lossy(), "nested.tar");
 
-                // Advance past content
-                parser.advance_content(entry.size).unwrap();
                 *consumed
             }
             other => panic!("Expected Entry, got {:?}", other),
@@ -2108,16 +2029,6 @@ mod tests {
         };
 
         assert_eq!(size, 512, "Entry size must reflect PAX override");
-
-        // Parser should now be in ReadContent state expecting 512 bytes
-        // If we try to parse again without advancing, it should return NeedData
-        let event = parser.parse(&[]).unwrap();
-        match event {
-            ParseEvent::NeedData { min_bytes } => {
-                assert_eq!(min_bytes, 512, "Parser must expect PAX size bytes");
-            }
-            other => panic!("Expected NeedData, got {:?}", other),
-        }
     }
 
     // =========================================================================

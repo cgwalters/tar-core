@@ -95,20 +95,15 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
                 });
 
                 if truncated {
-                    let _ = parser.advance_content(size);
                     break;
                 }
 
                 // Advance past content + padding.
                 let padded = (size as usize).next_multiple_of(HEADER_SIZE);
                 if offset.saturating_add(padded) > data.len() {
-                    let _ = parser.advance_content(size);
                     break;
                 }
                 offset += padded;
-                if parser.advance_content(size).is_err() {
-                    break;
-                }
             }
             Ok(ParseEvent::End { .. }) => break,
             Err(_) => break,

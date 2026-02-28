@@ -255,9 +255,6 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
                 let content = data[offset..offset + size].to_vec();
                 let padded_size = size.next_multiple_of(HEADER_SIZE);
                 offset += padded_size;
-                parser
-                    .advance_content(entry.size)
-                    .expect("advance_content should succeed");
 
                 results.push(EntryParams {
                     path,

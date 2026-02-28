@@ -59,13 +59,9 @@ fn run_parser(data: &[u8], limits: Limits) {
                 // Skip content + padding; if not enough data remains, bail out.
                 let padded = entry.padded_size() as usize;
                 if offset.saturating_add(padded) > data.len() {
-                    let _ = parser.advance_content(entry.size);
                     break;
                 }
                 offset += padded;
-                if parser.advance_content(entry.size).is_err() {
-                    break;
-                }
             }
 
             Ok(ParseEvent::End { consumed }) => {
