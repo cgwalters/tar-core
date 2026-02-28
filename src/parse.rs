@@ -1162,7 +1162,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{USTAR_MAGIC, USTAR_VERSION};
+    use crate::{GNU_MAGIC, GNU_VERSION, USTAR_MAGIC, USTAR_VERSION};
 
     #[test]
     fn test_default_limits() {
@@ -2338,6 +2338,649 @@ mod tests {
                 assert_eq!(entry.mtime, 1234567890);
             }
             other => panic!("Expected Entry, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // Sparse entry helpers
+    // =========================================================================
+
+    /// Encode a u64 as an 12-byte octal field (for sparse descriptor fields).
+    fn encode_octal_12(value: u64) -> [u8; 12] {
+        let s = format!("{value:011o}\0");
+        let mut field = [0u8; 12];
+        field.copy_from_slice(s.as_bytes());
+        field
+    }
+
+    /// Create a GNU sparse header (type 'S') with inline sparse descriptors.
+    ///
+    /// `entries` are (offset, length) pairs for the sparse map (max 4).
+    /// `on_disk_size` is the header's size field (total data bytes on disk).
+    /// `real_size` is the logical file size.
+    /// If `is_extended` is true, the isextended flag is set.
+    fn make_gnu_sparse_header(
+        name: &[u8],
+        entries: &[(u64, u64)],
+        on_disk_size: u64,
+        real_size: u64,
+        is_extended: bool,
+    ) -> [u8; HEADER_SIZE] {
+        assert!(entries.len() <= 4, "max 4 inline sparse descriptors");
+
+        let mut header = [0u8; HEADER_SIZE];
+
+        // name (0..100)
+        let name_len = name.len().min(100);
+        header[0..name_len].copy_from_slice(&name[..name_len]);
+
+        // mode (100..108)
+        header[100..107].copy_from_slice(b"0000644");
+        // uid (108..116)
+        header[108..115].copy_from_slice(b"0001750");
+        // gid (116..124)
+        header[116..123].copy_from_slice(b"0001750");
+
+        // size (124..136): on-disk data size
+        let size_str = format!("{on_disk_size:011o}");
+        header[124..135].copy_from_slice(size_str.as_bytes());
+
+        // mtime (136..148)
+        header[136..147].copy_from_slice(b"14712345670");
+
+        // typeflag (156): 'S' for sparse
+        header[156] = b'S';
+
+        // magic (257..263): GNU
+        header[257..263].copy_from_slice(GNU_MAGIC);
+        // version (263..265): GNU
+        header[263..265].copy_from_slice(GNU_VERSION);
+
+        // sparse descriptors at offset 386, each 24 bytes
+        for (i, &(offset, length)) in entries.iter().enumerate() {
+            let base = 386 + i * 24;
+            header[base..base + 12].copy_from_slice(&encode_octal_12(offset));
+            header[base + 12..base + 24].copy_from_slice(&encode_octal_12(length));
+        }
+
+        // isextended at offset 482
+        header[482] = if is_extended { 1 } else { 0 };
+
+        // realsize at offset 483
+        let real_str = format!("{real_size:011o}");
+        header[483..494].copy_from_slice(real_str.as_bytes());
+
+        // Compute and set checksum
+        let hdr = Header::from_bytes(&header);
+        let checksum = hdr.compute_checksum();
+        let checksum_str = format!("{checksum:06o}\0 ");
+        header[148..156].copy_from_slice(checksum_str.as_bytes());
+
+        header
+    }
+
+    /// Create a GNU extended sparse block (512 bytes) with up to 21
+    /// descriptors. Returns a 512-byte block.
+    fn make_gnu_ext_sparse(entries: &[(u64, u64)], is_extended: bool) -> [u8; HEADER_SIZE] {
+        assert!(entries.len() <= 21, "max 21 descriptors per ext block");
+
+        let mut block = [0u8; HEADER_SIZE];
+
+        for (i, &(offset, length)) in entries.iter().enumerate() {
+            let base = i * 24;
+            block[base..base + 12].copy_from_slice(&encode_octal_12(offset));
+            block[base + 12..base + 24].copy_from_slice(&encode_octal_12(length));
+        }
+
+        // isextended at offset 504 (byte after 21 * 24 = 504)
+        block[504] = if is_extended { 1 } else { 0 };
+
+        block
+    }
+
+    // =========================================================================
+    // Sparse entry tests
+    // =========================================================================
+
+    #[test]
+    fn test_sparse_basic() {
+        // Sparse file with 2 data regions: [0x1000..0x1005) and [0x3000..0x3005)
+        // On-disk size: 10 bytes (5 + 5), real size: 0x3005
+        let header = make_gnu_sparse_header(
+            b"sparse.txt",
+            &[(0x1000, 5), (0x3000, 5)],
+            10,     // on-disk
+            0x3005, // real size
+            false,
+        );
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        // Content (10 bytes, padded to 512)
+        let mut content = [0u8; HEADER_SIZE];
+        content[0..5].copy_from_slice(b"hello");
+        content[5..10].copy_from_slice(b"world");
+        archive.extend_from_slice(&content);
+        archive.extend(zeroes(1024)); // end of archive
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                consumed,
+                entry,
+                sparse_map,
+                real_size,
+            } => {
+                assert_eq!(consumed, HEADER_SIZE);
+                assert_eq!(entry.path_lossy(), "sparse.txt");
+                assert_eq!(entry.size, 10);
+                assert_eq!(real_size, 0x3005);
+                assert_eq!(sparse_map.len(), 2);
+                assert_eq!(
+                    sparse_map[0],
+                    SparseEntry {
+                        offset: 0x1000,
+                        length: 5
+                    }
+                );
+                assert_eq!(
+                    sparse_map[1],
+                    SparseEntry {
+                        offset: 0x3000,
+                        length: 5
+                    }
+                );
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_no_entries() {
+        // Sparse file with no data regions (all zeros), real size 4096
+        let header = make_gnu_sparse_header(b"empty_sparse.txt", &[], 0, 4096, false);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                sparse_map,
+                real_size,
+                entry,
+                ..
+            } => {
+                assert!(sparse_map.is_empty());
+                assert_eq!(real_size, 4096);
+                assert_eq!(entry.size, 0);
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_four_inline_entries() {
+        // Max inline: 4 sparse descriptors
+        let entries = [(0u64, 512), (1024, 512), (2048, 512), (3072, 512)];
+        let on_disk: u64 = entries.iter().map(|(_, l)| l).sum();
+        let real_size = 3072 + 512;
+        let header = make_gnu_sparse_header(b"four.txt", &entries, on_disk, real_size, false);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                sparse_map,
+                real_size: rs,
+                ..
+            } => {
+                assert_eq!(sparse_map.len(), 4);
+                assert_eq!(rs, real_size);
+                for (i, &(off, len)) in entries.iter().enumerate() {
+                    assert_eq!(sparse_map[i].offset, off);
+                    assert_eq!(sparse_map[i].length, len);
+                }
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_with_extension_block() {
+        // 4 inline + 2 in extension block = 6 total
+        let inline_entries = [(0u64, 100), (512, 100), (1024, 100), (1536, 100)];
+        let ext_entries = [(2048u64, 100), (2560, 100)];
+        let on_disk: u64 = 600; // 6 * 100
+        let real_size = 2660; // 2560 + 100
+
+        let header =
+            make_gnu_sparse_header(b"extended.txt", &inline_entries, on_disk, real_size, true);
+        let ext = make_gnu_ext_sparse(&ext_entries, false);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(&ext);
+        archive.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                consumed,
+                sparse_map,
+                real_size: rs,
+                ..
+            } => {
+                // consumed = main header + 1 extension block
+                assert_eq!(consumed, 2 * HEADER_SIZE);
+                assert_eq!(rs, real_size);
+                assert_eq!(sparse_map.len(), 6);
+                assert_eq!(sparse_map[4].offset, 2048);
+                assert_eq!(sparse_map[5].offset, 2560);
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_multiple_extension_blocks() {
+        // 4 inline + 21 in ext1 + 3 in ext2 = 28 total
+        let inline = [(0u64, 10), (100, 10), (200, 10), (300, 10)];
+        let mut ext1_entries = Vec::new();
+        for i in 0..21 {
+            ext1_entries.push((400 + i * 100, 10u64));
+        }
+        let ext2_entries = [(2500u64, 10), (2600, 10), (2700, 10)];
+        let on_disk = 28 * 10u64;
+        let real_size = 2710;
+
+        let header = make_gnu_sparse_header(b"multi_ext.txt", &inline, on_disk, real_size, true);
+        let ext1 = make_gnu_ext_sparse(&ext1_entries, true);
+        let ext2 = make_gnu_ext_sparse(&ext2_entries, false);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(&ext1);
+        archive.extend_from_slice(&ext2);
+        archive.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                consumed,
+                sparse_map,
+                real_size: rs,
+                ..
+            } => {
+                assert_eq!(consumed, 3 * HEADER_SIZE);
+                assert_eq!(rs, real_size);
+                assert_eq!(sparse_map.len(), 28);
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_need_data_for_extension() {
+        // Header says isextended=true, but we only provide the header.
+        // Parser should return NeedData.
+        let header = make_gnu_sparse_header(
+            b"need_ext.txt",
+            &[(0, 100)],
+            100,
+            100,
+            true, // extension expected
+        );
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&header).unwrap();
+
+        match event {
+            ParseEvent::NeedData { min_bytes } => {
+                assert_eq!(min_bytes, 2 * HEADER_SIZE);
+            }
+            other => panic!("Expected NeedData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_need_data_chained_extensions() {
+        // Header + ext1 (isextended=true), but ext2 not provided.
+        let header = make_gnu_sparse_header(b"chain.txt", &[(0, 10)], 20, 20, true);
+        let ext1 = make_gnu_ext_sparse(&[(10, 10)], true); // needs another block
+
+        let mut input = Vec::new();
+        input.extend_from_slice(&header);
+        input.extend_from_slice(&ext1);
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&input).unwrap();
+
+        match event {
+            ParseEvent::NeedData { min_bytes } => {
+                assert_eq!(min_bytes, 3 * HEADER_SIZE);
+            }
+            other => panic!("Expected NeedData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_not_gnu_header() {
+        // UStar header with type 'S' — should error since sparse requires GNU
+        let header = make_header(b"bad_sparse.txt", 0, b'S');
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let err = parser.parse(&archive).unwrap_err();
+        assert!(matches!(err, ParseError::SparseNotGnu));
+    }
+
+    #[test]
+    fn test_sparse_too_many_entries() {
+        // Set a low limit and exceed it via extension blocks.
+        let header = make_gnu_sparse_header(
+            b"too_many.txt",
+            &[(0, 10), (100, 10), (200, 10)],
+            40,
+            400,
+            true,
+        );
+        // Extension block with 3 more entries → total 6
+        let ext = make_gnu_ext_sparse(&[(300, 10)], false);
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(&ext);
+        archive.extend(zeroes(512));
+        archive.extend(zeroes(1024));
+
+        let limits = Limits {
+            max_sparse_entries: 3,
+            ..Default::default()
+        };
+        let mut parser = Parser::new(limits);
+        let err = parser.parse(&archive).unwrap_err();
+        assert!(matches!(
+            err,
+            ParseError::TooManySparseEntries { count: 4, limit: 3 }
+        ));
+    }
+
+    #[test]
+    fn test_sparse_with_gnu_long_name() {
+        // GNU long name followed by a sparse entry — both extensions
+        // should compose correctly.
+        let long_name = "a/".to_string() + &"x".repeat(200);
+
+        let on_disk = 512u64;
+        let real_size = 8192u64;
+        let header = make_gnu_sparse_header(b"placeholder", &[(0, 512)], on_disk, real_size, false);
+
+        let mut archive = Vec::new();
+        archive.extend(make_gnu_long_name(long_name.as_bytes()));
+        archive.extend_from_slice(&header);
+        archive.extend(zeroes(on_disk as usize)); // content
+        archive.extend(zeroes(1024)); // end
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::SparseEntry {
+                entry,
+                sparse_map,
+                real_size: rs,
+                ..
+            } => {
+                assert_eq!(entry.path.as_ref(), long_name.as_bytes());
+                assert_eq!(rs, real_size);
+                assert_eq!(sparse_map.len(), 1);
+                assert_eq!(sparse_map[0].length, 512);
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sparse_need_data_is_side_effect_free() {
+        // Provide only the header (isextended=true) → NeedData.
+        // Then provide the full archive → SparseEntry.
+        // The parser should not have modified state from the first call.
+        let header = make_gnu_sparse_header(b"retry.txt", &[(0, 100)], 200, 300, true);
+        let ext = make_gnu_ext_sparse(&[(100, 100)], false);
+
+        let mut parser = Parser::new(Limits::default());
+
+        // First attempt: only header
+        let event = parser.parse(&header).unwrap();
+        assert!(matches!(event, ParseEvent::NeedData { .. }));
+
+        // Second attempt: full archive
+        let mut full = Vec::new();
+        full.extend_from_slice(&header);
+        full.extend_from_slice(&ext);
+        full.extend(zeroes(512)); // content
+        full.extend(zeroes(1024)); // end
+
+        let event = parser.parse(&full).unwrap();
+        match event {
+            ParseEvent::SparseEntry {
+                consumed,
+                sparse_map,
+                ..
+            } => {
+                assert_eq!(consumed, 2 * HEADER_SIZE);
+                assert_eq!(sparse_map.len(), 2);
+            }
+            other => panic!("Expected SparseEntry, got {other:?}"),
+        }
+    }
+
+    // =========================================================================
+    // Sparse proptests
+    // =========================================================================
+
+    mod sparse_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy for a sparse map: a sorted list of non-overlapping
+        /// (offset, length) pairs with reasonable values.
+        fn sparse_map_strategy(max_entries: usize) -> impl Strategy<Value = Vec<(u64, u64)>> {
+            proptest::collection::vec((0u64..0x10_000, 1u64..0x1000), 0..=max_entries).prop_map(
+                |raw| {
+                    // Sort by offset, then deduplicate/separate so entries
+                    // don't overlap.
+                    let mut entries: Vec<(u64, u64)> = Vec::new();
+                    let mut cursor = 0u64;
+                    for (gap, length) in raw {
+                        let offset = cursor.saturating_add(gap);
+                        entries.push((offset, length));
+                        cursor = offset.saturating_add(length);
+                    }
+                    entries
+                },
+            )
+        }
+
+        proptest! {
+            #[test]
+            fn test_sparse_roundtrip_inline(
+                entries in sparse_map_strategy(4),
+                name_len in 1usize..50,
+            ) {
+                let name: Vec<u8> = (0..name_len).map(|i| b'a' + (i % 26) as u8).collect();
+                let on_disk: u64 = entries.iter().map(|(_, l)| l).sum();
+                let real_size = entries.last().map(|(o, l)| o + l).unwrap_or(0);
+
+                let header = make_gnu_sparse_header(
+                    &name,
+                    &entries,
+                    on_disk,
+                    real_size,
+                    false,
+                );
+
+                let mut archive = Vec::new();
+                archive.extend_from_slice(&header);
+                archive.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+                archive.extend(zeroes(1024));
+
+                let mut parser = Parser::new(Limits::default());
+                let event = parser.parse(&archive).unwrap();
+
+                match event {
+                    ParseEvent::SparseEntry {
+                        consumed,
+                        sparse_map,
+                        real_size: rs,
+                        entry,
+                        ..
+                    } => {
+                        prop_assert_eq!(consumed, HEADER_SIZE);
+                        prop_assert_eq!(&entry.path[..], &name[..]);
+                        prop_assert_eq!(rs, real_size);
+                        prop_assert_eq!(sparse_map.len(), entries.len());
+                        for (i, &(off, len)) in entries.iter().enumerate() {
+                            prop_assert_eq!(sparse_map[i].offset, off);
+                            prop_assert_eq!(sparse_map[i].length, len);
+                        }
+                    }
+                    other => {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            format!("Expected SparseEntry, got {other:?}")));
+                    }
+                }
+            }
+
+            #[test]
+            fn test_sparse_roundtrip_extended(
+                // 5..=25 entries forces at least one extension block
+                entries in sparse_map_strategy(25).prop_filter(
+                    "need >4 entries for extension",
+                    |e| e.len() > 4
+                ),
+            ) {
+                let on_disk: u64 = entries.iter().map(|(_, l)| l).sum();
+                let real_size = entries.last().map(|(o, l)| o + l).unwrap_or(0);
+
+                // Split into inline (first 4) and extension blocks (21 per block)
+                let (inline, rest) = entries.split_at(4);
+                let header = make_gnu_sparse_header(
+                    b"proptest_ext.bin",
+                    inline,
+                    on_disk,
+                    real_size,
+                    !rest.is_empty(),
+                );
+
+                let mut archive = Vec::new();
+                archive.extend_from_slice(&header);
+
+                // Emit extension blocks, 21 entries per block
+                let chunks: Vec<&[(u64, u64)]> = rest.chunks(21).collect();
+                for (i, chunk) in chunks.iter().enumerate() {
+                    let is_last = i == chunks.len() - 1;
+                    let ext = make_gnu_ext_sparse(chunk, !is_last);
+                    archive.extend_from_slice(&ext);
+                }
+
+                archive.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+                archive.extend(zeroes(1024));
+
+                let mut parser = Parser::new(Limits::default());
+                let event = parser.parse(&archive).unwrap();
+
+                match event {
+                    ParseEvent::SparseEntry {
+                        consumed,
+                        sparse_map,
+                        real_size: rs,
+                        ..
+                    } => {
+                        let expected_blocks = 1 + chunks.len();
+                        prop_assert_eq!(consumed, expected_blocks * HEADER_SIZE);
+                        prop_assert_eq!(rs, real_size);
+                        prop_assert_eq!(sparse_map.len(), entries.len());
+                        for (i, &(off, len)) in entries.iter().enumerate() {
+                            prop_assert_eq!(sparse_map[i].offset, off);
+                            prop_assert_eq!(sparse_map[i].length, len);
+                        }
+                    }
+                    other => {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            format!("Expected SparseEntry, got {other:?}")));
+                    }
+                }
+            }
+
+            #[test]
+            fn test_sparse_need_data_then_retry(
+                n_ext_entries in 1usize..10,
+            ) {
+                // Build a sparse file with extension blocks, feed partial
+                // data first (just the header), verify NeedData, then feed
+                // the full archive and verify success.
+                let inline = [(0u64, 100), (200, 100), (400, 100), (600, 100)];
+                let ext_entries: Vec<(u64, u64)> = (0..n_ext_entries)
+                    .map(|i| (800 + i as u64 * 200, 100))
+                    .collect();
+                let total = 4 + n_ext_entries;
+                let on_disk = total as u64 * 100;
+                let real_size = ext_entries.last().map(|(o, l)| o + l).unwrap_or(800);
+
+                let header = make_gnu_sparse_header(
+                    b"retry_ext.txt",
+                    &inline,
+                    on_disk,
+                    real_size,
+                    true,
+                );
+                let ext = make_gnu_ext_sparse(&ext_entries, false);
+
+                let mut parser = Parser::new(Limits::default());
+
+                // Partial: just the header
+                let event = parser.parse(&header).unwrap();
+                assert!(matches!(event, ParseEvent::NeedData { .. }));
+
+                // Full archive
+                let mut full = Vec::new();
+                full.extend_from_slice(&header);
+                full.extend_from_slice(&ext);
+                full.extend(zeroes(on_disk.next_multiple_of(512) as usize));
+                full.extend(zeroes(1024));
+
+                let event = parser.parse(&full).unwrap();
+                match event {
+                    ParseEvent::SparseEntry { sparse_map, .. } => {
+                        prop_assert_eq!(sparse_map.len(), total);
+                    }
+                    other => {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            format!("Expected SparseEntry, got {other:?}")));
+                    }
+                }
+            }
         }
     }
 }
