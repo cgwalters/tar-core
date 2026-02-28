@@ -31,7 +31,7 @@
 //! | 116    | 8    | gid       | Owner group ID in octal ASCII            |
 //! | 124    | 12   | size      | File size in octal ASCII                 |
 //! | 136    | 12   | mtime     | Modification time (Unix epoch, octal)    |
-//! | 148    | 8    | checksum  | Header checksum in octal ASCII           |
+//! | 148    | 8    | cksum     | Header checksum in octal ASCII           |
 //! | 156    | 1    | typeflag  | Entry type (see [`EntryType`])           |
 //! | 157    | 100  | linkname  | Link target for hard/symbolic links      |
 //!
@@ -43,8 +43,8 @@
 //! | 263    | 2    | version   | "00"                                     |
 //! | 265    | 32   | uname     | Owner user name                          |
 //! | 297    | 32   | gname     | Owner group name                         |
-//! | 329    | 8    | devmajor  | Device major number                      |
-//! | 337    | 8    | devminor  | Device minor number                      |
+//! | 329    | 8    | dev_major | Device major number                      |
+//! | 337    | 8    | dev_minor | Device minor number                      |
 //! | 345    | 155  | prefix    | Path prefix for long names               |
 //!
 //! **GNU extension** (offsets 257-500, replaces prefix):
@@ -165,9 +165,9 @@ pub struct OldHeader {
     /// Modification time as Unix timestamp in octal ASCII.
     pub mtime: [u8; 12],
     /// Header checksum in octal ASCII.
-    pub checksum: [u8; 8],
-    /// Entry type flag.
-    pub typeflag: u8,
+    pub cksum: [u8; 8],
+    /// Entry type flag (called `linkflag` in the original V7 format).
+    pub linkflag: [u8; 1],
     /// Link target name for hard/symbolic links.
     pub linkname: [u8; 100],
     /// Padding to fill the 512-byte block.
@@ -183,8 +183,8 @@ impl Default for OldHeader {
             gid: [0u8; 8],
             size: [0u8; 12],
             mtime: [0u8; 12],
-            checksum: [0u8; 8],
-            typeflag: 0,
+            cksum: [0u8; 8],
+            linkflag: [0],
             linkname: [0u8; 100],
             pad: [0u8; 255],
         }
@@ -196,7 +196,7 @@ impl fmt::Debug for OldHeader {
         f.debug_struct("OldHeader")
             .field("name", &String::from_utf8_lossy(truncate_null(&self.name)))
             .field("mode", &String::from_utf8_lossy(truncate_null(&self.mode)))
-            .field("typeflag", &self.typeflag)
+            .field("linkflag", &self.linkflag[0])
             .finish_non_exhaustive()
     }
 }
@@ -222,9 +222,9 @@ pub struct UstarHeader {
     /// Modification time as Unix timestamp in octal ASCII.
     pub mtime: [u8; 12],
     /// Header checksum in octal ASCII.
-    pub checksum: [u8; 8],
+    pub cksum: [u8; 8],
     /// Entry type flag.
-    pub typeflag: u8,
+    pub typeflag: [u8; 1],
     /// Link target name for hard/symbolic links.
     pub linkname: [u8; 100],
     /// Magic string identifying the format ("ustar\0" for UStar).
@@ -236,9 +236,9 @@ pub struct UstarHeader {
     /// Owner group name (null-terminated).
     pub gname: [u8; 32],
     /// Device major number in octal ASCII (for special files).
-    pub devmajor: [u8; 8],
+    pub dev_major: [u8; 8],
     /// Device minor number in octal ASCII (for special files).
-    pub devminor: [u8; 8],
+    pub dev_minor: [u8; 8],
     /// Path prefix for names longer than 100 bytes.
     pub prefix: [u8; 155],
     /// Padding to fill the 512-byte block.
@@ -254,15 +254,15 @@ impl Default for UstarHeader {
             gid: [0u8; 8],
             size: [0u8; 12],
             mtime: [0u8; 12],
-            checksum: [0u8; 8],
-            typeflag: 0,
+            cksum: [0u8; 8],
+            typeflag: [0],
             linkname: [0u8; 100],
             magic: [0u8; 6],
             version: [0u8; 2],
             uname: [0u8; 32],
             gname: [0u8; 32],
-            devmajor: [0u8; 8],
-            devminor: [0u8; 8],
+            dev_major: [0u8; 8],
+            dev_minor: [0u8; 8],
             prefix: [0u8; 155],
             pad: [0u8; 12],
         };
@@ -277,7 +277,7 @@ impl fmt::Debug for UstarHeader {
         f.debug_struct("UstarHeader")
             .field("name", &String::from_utf8_lossy(truncate_null(&self.name)))
             .field("mode", &String::from_utf8_lossy(truncate_null(&self.mode)))
-            .field("typeflag", &self.typeflag)
+            .field("typeflag", &self.typeflag[0])
             .field("magic", &self.magic)
             .field(
                 "uname",
@@ -343,6 +343,43 @@ impl GnuSparseHeader {
         encode_numeric(&mut self.numbytes, entry.length)
             .expect("u64 always fits in 12-byte numeric field");
     }
+
+    /// Get the offset of this sparse chunk.
+    ///
+    /// Handles both octal ASCII and GNU base-256 encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeaderError::InvalidOctal`] if the field is malformed.
+    pub fn offset(&self) -> Result<u64> {
+        parse_numeric(&self.offset)
+    }
+
+    /// Set the offset of this sparse chunk.
+    ///
+    /// Uses octal ASCII if the value fits, otherwise GNU base-256 encoding.
+    pub fn set_offset(&mut self, offset: u64) {
+        encode_numeric(&mut self.offset, offset).expect("u64 always fits in 12-byte numeric field");
+    }
+
+    /// Get the length (numbytes) of this sparse chunk.
+    ///
+    /// Handles both octal ASCII and GNU base-256 encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeaderError::InvalidOctal`] if the field is malformed.
+    pub fn length(&self) -> Result<u64> {
+        parse_numeric(&self.numbytes)
+    }
+
+    /// Set the length (numbytes) of this sparse chunk.
+    ///
+    /// Uses octal ASCII if the value fits, otherwise GNU base-256 encoding.
+    pub fn set_length(&mut self, length: u64) {
+        encode_numeric(&mut self.numbytes, length)
+            .expect("u64 always fits in 12-byte numeric field");
+    }
 }
 
 impl fmt::Debug for GnuSparseHeader {
@@ -375,9 +412,9 @@ pub struct GnuHeader {
     /// Modification time as Unix timestamp in octal ASCII.
     pub mtime: [u8; 12],
     /// Header checksum in octal ASCII.
-    pub checksum: [u8; 8],
+    pub cksum: [u8; 8],
     /// Entry type flag.
-    pub typeflag: u8,
+    pub typeflag: [u8; 1],
     /// Link target name for hard/symbolic links.
     pub linkname: [u8; 100],
     /// Magic string identifying the format ("ustar " for GNU).
@@ -389,9 +426,9 @@ pub struct GnuHeader {
     /// Owner group name (null-terminated).
     pub gname: [u8; 32],
     /// Device major number in octal ASCII (for special files).
-    pub devmajor: [u8; 8],
+    pub dev_major: [u8; 8],
     /// Device minor number in octal ASCII (for special files).
-    pub devminor: [u8; 8],
+    pub dev_minor: [u8; 8],
     /// Access time in octal ASCII.
     pub atime: [u8; 12],
     /// Creation time in octal ASCII.
@@ -401,11 +438,11 @@ pub struct GnuHeader {
     /// Long names support (deprecated).
     pub longnames: [u8; 4],
     /// Unused padding byte.
-    pub unused: u8,
+    pub unused: [u8; 1],
     /// Sparse file chunk descriptors (4 entries).
     pub sparse: [GnuSparseHeader; 4],
     /// Flag indicating more sparse headers follow.
-    pub isextended: u8,
+    pub isextended: [u8; 1],
     /// Real size of sparse file (uncompressed).
     pub realsize: [u8; 12],
     /// Padding to fill the 512-byte block.
@@ -421,22 +458,22 @@ impl Default for GnuHeader {
             gid: [0u8; 8],
             size: [0u8; 12],
             mtime: [0u8; 12],
-            checksum: [0u8; 8],
-            typeflag: 0,
+            cksum: [0u8; 8],
+            typeflag: [0],
             linkname: [0u8; 100],
             magic: [0u8; 6],
             version: [0u8; 2],
             uname: [0u8; 32],
             gname: [0u8; 32],
-            devmajor: [0u8; 8],
-            devminor: [0u8; 8],
+            dev_major: [0u8; 8],
+            dev_minor: [0u8; 8],
             atime: [0u8; 12],
             ctime: [0u8; 12],
             offset: [0u8; 12],
             longnames: [0u8; 4],
-            unused: 0,
+            unused: [0],
             sparse: [GnuSparseHeader::default(); 4],
-            isextended: 0,
+            isextended: [0],
             realsize: [0u8; 12],
             pad: [0u8; 17],
         };
@@ -509,12 +546,12 @@ impl GnuHeader {
     /// When true, the next 512-byte block contains a [`GnuExtSparseHeader`].
     #[must_use]
     pub fn is_extended(&self) -> bool {
-        self.isextended == 1
+        self.isextended[0] == 1
     }
 
     /// Sets whether this header should be followed by additional sparse headers.
     pub fn set_is_extended(&mut self, extended: bool) {
-        self.isextended = if extended { 1 } else { 0 };
+        self.isextended[0] = if extended { 1 } else { 0 };
     }
 }
 
@@ -523,9 +560,9 @@ impl fmt::Debug for GnuHeader {
         f.debug_struct("GnuHeader")
             .field("name", &String::from_utf8_lossy(truncate_null(&self.name)))
             .field("mode", &String::from_utf8_lossy(truncate_null(&self.mode)))
-            .field("typeflag", &self.typeflag)
+            .field("typeflag", &self.typeflag[0])
             .field("magic", &self.magic)
-            .field("isextended", &self.isextended)
+            .field("isextended", &self.isextended[0])
             .finish_non_exhaustive()
     }
 }
@@ -541,7 +578,7 @@ pub struct GnuExtSparseHeader {
     /// Sparse chunk descriptors (21 entries).
     pub sparse: [GnuSparseHeader; 21],
     /// Flag indicating more sparse headers follow.
-    pub isextended: u8,
+    pub isextended: [u8; 1],
     /// Padding to fill the 512-byte block.
     pub pad: [u8; 7],
 }
@@ -550,19 +587,19 @@ impl GnuExtSparseHeader {
     /// Returns whether another extension block follows this one.
     #[must_use]
     pub fn is_extended(&self) -> bool {
-        self.isextended == 1
+        self.isextended[0] == 1
     }
 
     /// Sets whether another extension block follows this one.
     pub fn set_is_extended(&mut self, extended: bool) {
-        self.isextended = if extended { 1 } else { 0 };
+        self.isextended[0] = if extended { 1 } else { 0 };
     }
 }
 
 impl fmt::Debug for GnuExtSparseHeader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GnuExtSparseHeader")
-            .field("isextended", &self.isextended)
+            .field("isextended", &self.isextended[0])
             .finish_non_exhaustive()
     }
 }
@@ -1300,14 +1337,14 @@ impl Header {
     /// matching tar-rs for bit-identical output.
     pub fn set_checksum(&mut self) {
         // Fill checksum field with spaces for calculation
-        self.as_ustar_mut().checksum.fill(b' ');
+        self.as_ustar_mut().cksum.fill(b' ');
 
         // Compute unsigned sum of all bytes
         let checksum: u64 = self.bytes.iter().map(|&b| u64::from(b)).sum();
 
         // Max checksum = 512 * 255 = 130560, which always fits in 8-byte octal
         // (max representable: 07777777 = 2097151).
-        encode_octal(&mut self.as_ustar_mut().checksum, checksum)
+        encode_octal(&mut self.as_ustar_mut().cksum, checksum)
             .expect("checksum always fits in 8-byte octal field");
     }
 
@@ -1391,8 +1428,8 @@ impl Header {
     /// [`set_device_small`](Self::set_device_small).
     pub fn set_device(&mut self, major: u32, minor: u32) -> Result<()> {
         let fields = self.as_ustar_mut();
-        encode_octal(&mut fields.devmajor, u64::from(major))?;
-        encode_octal(&mut fields.devminor, u64::from(minor))
+        encode_octal(&mut fields.dev_major, u64::from(major))?;
+        encode_octal(&mut fields.dev_minor, u64::from(minor))
     }
 
     /// Set device major and minor numbers from `u16` values.
@@ -1401,9 +1438,9 @@ impl Header {
     /// fields (max 2097151). Covers all real-world device numbers.
     pub fn set_device_small(&mut self, major: u16, minor: u16) {
         let fields = self.as_ustar_mut();
-        encode_octal(&mut fields.devmajor, u64::from(major))
+        encode_octal(&mut fields.dev_major, u64::from(major))
             .expect("u16 always fits in 8-byte octal field");
-        encode_octal(&mut fields.devminor, u64::from(minor))
+        encode_octal(&mut fields.dev_minor, u64::from(minor))
             .expect("u16 always fits in 8-byte octal field");
     }
 }
@@ -2361,7 +2398,7 @@ mod tests {
     #[test]
     fn test_ext_sparse_header() {
         let ext = GnuExtSparseHeader::default();
-        assert_eq!(ext.isextended, 0);
+        assert_eq!(ext.isextended[0], 0);
         assert_eq!(ext.sparse.len(), 21);
 
         // Verify size is exactly 512 bytes

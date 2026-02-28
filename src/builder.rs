@@ -123,7 +123,7 @@ impl HeaderBuilder {
     ///
     /// Both UStar and GNU formats share the same field layout for the
     /// common fields (name, mode, uid, gid, size, mtime, checksum,
-    /// typeflag, linkname, uname, gname, devmajor, devminor).
+    /// typeflag, linkname, uname, gname, dev_major, dev_minor).
     fn fields_mut(&mut self) -> &mut UstarHeader {
         self.header.as_ustar_mut()
     }
@@ -207,7 +207,7 @@ impl HeaderBuilder {
 
     /// Set the entry type.
     pub fn entry_type(&mut self, entry_type: EntryType) -> &mut Self {
-        self.fields_mut().typeflag = entry_type.to_byte();
+        self.fields_mut().typeflag[0] = entry_type.to_byte();
         self
     }
 
@@ -288,14 +288,14 @@ impl HeaderBuilder {
     #[must_use]
     pub fn finish(&mut self) -> Header {
         // Fill checksum field with spaces for calculation
-        self.header.as_ustar_mut().checksum.fill(b' ');
+        self.header.as_ustar_mut().cksum.fill(b' ');
 
         // Compute unsigned sum of all bytes
         let checksum: u64 = self.header.as_bytes().iter().map(|&b| u64::from(b)).sum();
 
         // Max checksum = 512 * 255 = 130560, which always fits in 8-byte octal
         // (max representable: 07777777 = 2097151).
-        crate::encode_octal(&mut self.header.as_ustar_mut().checksum, checksum)
+        crate::encode_octal(&mut self.header.as_ustar_mut().cksum, checksum)
             .expect("checksum always fits in 8-byte octal field");
 
         self.header
