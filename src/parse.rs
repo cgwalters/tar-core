@@ -375,6 +375,22 @@ pub enum ParseEvent<'a> {
         real_size: u64,
     },
 
+    /// A PAX global extended header (type 'g') has been parsed.
+    ///
+    /// Per POSIX, global headers apply default attributes to all subsequent
+    /// entries in the archive. However, this parser does **not** apply them
+    /// automatically — it surfaces the raw data so the caller can decide
+    /// how to handle it (e.g., merge into a defaults table, ignore, etc.).
+    ///
+    /// The `pax_data` can be parsed with
+    /// [`PaxExtensions::new`](crate::PaxExtensions::new).
+    GlobalExtensions {
+        /// Number of bytes consumed from the input (header + padded content).
+        consumed: usize,
+        /// The raw PAX key-value data from the global header.
+        pax_data: Vec<u8>,
+    },
+
     /// Archive end marker reached (two consecutive zero blocks, or clean EOF).
     End {
         /// Number of bytes consumed from the input.
@@ -410,6 +426,10 @@ impl<'a> ParseEvent<'a> {
                 entry,
                 sparse_map,
                 real_size,
+            },
+            ParseEvent::GlobalExtensions { consumed, pax_data } => ParseEvent::GlobalExtensions {
+                consumed: consumed + n,
+                pax_data,
             },
             ParseEvent::End { consumed } => ParseEvent::End {
                 consumed: consumed + n,
@@ -756,16 +776,29 @@ impl Parser {
                 self.handle_extension(input, size, padded_size, ExtensionKind::Pax)
             }
             EntryType::XGlobalHeader => {
-                // Skip global PAX headers
+                // Check size limit (same as local PAX headers)
+                if size > self.limits.max_pax_size {
+                    return Err(ParseError::PaxTooLarge {
+                        size,
+                        limit: self.limits.max_pax_size,
+                    });
+                }
+
                 let total_size = HEADER_SIZE as u64 + padded_size;
                 if (input.len() as u64) < total_size {
                     return Ok(ParseEvent::NeedData {
                         min_bytes: total_size as usize,
                     });
                 }
-                // Recurse to parse next header
-                self.parse_header(&input[total_size as usize..])
-                    .map(|e| e.add_consumed(total_size as usize))
+
+                let content_start = HEADER_SIZE;
+                let content_end = content_start + size as usize;
+                let pax_data = input[content_start..content_end].to_vec();
+
+                Ok(ParseEvent::GlobalExtensions {
+                    consumed: total_size as usize,
+                    pax_data,
+                })
             }
             EntryType::GnuSparse => self.handle_gnu_sparse(input, header, size),
             _ => {
@@ -1860,6 +1893,49 @@ mod tests {
         result
     }
 
+    /// Create a PAX global extended header (type 'g') with the given key-value pairs.
+    ///
+    /// Returns the complete entry: header + padded content.
+    fn make_pax_global_header(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        // Build PAX content identically to make_pax_header, just with type 'g'.
+        let mut content = Vec::new();
+        for (key, value) in entries {
+            let base_len = 1 + key.len() + 1 + value.len() + 1;
+            let mut total_len = base_len + 1;
+            loop {
+                let digit_count = if total_len < 10 {
+                    1
+                } else if total_len < 100 {
+                    2
+                } else if total_len < 1000 {
+                    3
+                } else {
+                    4
+                };
+                let new_len = base_len + digit_count;
+                if new_len == total_len {
+                    break;
+                }
+                total_len = new_len;
+            }
+            let record = format!("{total_len} {key}=");
+            content.extend_from_slice(record.as_bytes());
+            content.extend_from_slice(value);
+            content.push(b'\n');
+        }
+
+        let content_size = content.len();
+        let header = make_header(b"pax_global_header", content_size as u64, b'g');
+
+        let padded = content_size.next_multiple_of(HEADER_SIZE);
+        let mut result = Vec::with_capacity(HEADER_SIZE + padded);
+        result.extend_from_slice(&header);
+        result.extend_from_slice(&content);
+        result.extend(zeroes(padded - content_size));
+
+        result
+    }
+
     /// Return `n` zero bytes (for end-of-archive markers, padding, etc.).
     fn zeroes(n: usize) -> impl Iterator<Item = u8> {
         std::iter::repeat_n(0u8, n)
@@ -2145,6 +2221,170 @@ mod tests {
                     entry.link_target.as_ref().unwrap().as_ref(),
                     pax_linkpath.as_bytes()
                 );
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    // =========================================================================
+    // PAX global header tests
+    // =========================================================================
+
+    #[test]
+    fn test_parser_global_pax_header() {
+        // A global PAX header should be surfaced as a GlobalExtensions event,
+        // not silently skipped.
+        let mut archive = Vec::new();
+        archive.extend(make_pax_global_header(&[
+            ("mtime", b"1700000000"),
+            (
+                "SCHILY.xattr.security.selinux",
+                b"system_u:object_r:default_t:s0",
+            ),
+        ]));
+        // Followed by a regular file entry
+        archive.extend_from_slice(&make_header(b"file.txt", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+
+        // First event: GlobalExtensions
+        let event = parser.parse(&archive).unwrap();
+        let consumed = match &event {
+            ParseEvent::GlobalExtensions { consumed, pax_data } => {
+                // Verify the raw PAX data can be parsed
+                let exts = PaxExtensions::new(pax_data);
+                let keys: Vec<&str> = exts
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.key().ok())
+                    .collect();
+                assert_eq!(keys, &["mtime", "SCHILY.xattr.security.selinux"]);
+                *consumed
+            }
+            other => panic!("Expected GlobalExtensions, got {:?}", other),
+        };
+
+        // Second event: the actual file entry (global headers don't affect it)
+        let event = parser.parse(&archive[consumed..]).unwrap();
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.path_lossy(), "file.txt");
+                // Global header should NOT have modified this entry's metadata
+                assert!(entry.pax.is_none());
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_global_pax_header_need_data() {
+        // Global PAX header present but content not yet available
+        let header = make_header(b"pax_global_header", 100, b'g');
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&header).unwrap();
+
+        match event {
+            ParseEvent::NeedData { min_bytes } => {
+                assert_eq!(min_bytes, 1024); // header (512) + padded content (512)
+            }
+            other => panic!("Expected NeedData, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_global_pax_header_too_large() {
+        // Global PAX header exceeding max_pax_size should error
+        let large_value = "x".repeat(1000);
+
+        let mut archive = Vec::new();
+        archive.extend(make_pax_global_header(&[(
+            "comment",
+            large_value.as_bytes(),
+        )]));
+        archive.extend_from_slice(&make_header(b"file.txt", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let limits = Limits {
+            max_pax_size: 100,
+            ..Default::default()
+        };
+        let mut parser = Parser::new(limits);
+        let result = parser.parse(&archive);
+
+        assert!(matches!(result, Err(ParseError::PaxTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_parser_multiple_global_pax_headers() {
+        // Multiple global PAX headers in a row should each produce a
+        // separate GlobalExtensions event (they don't use the pending
+        // metadata mechanism).
+        let mut archive = Vec::new();
+        archive.extend(make_pax_global_header(&[("comment", b"first")]));
+        archive.extend(make_pax_global_header(&[("comment", b"second")]));
+        archive.extend_from_slice(&make_header(b"file.txt", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+
+        // First global header
+        let event = parser.parse(&archive).unwrap();
+        let consumed1 = match &event {
+            ParseEvent::GlobalExtensions { consumed, pax_data } => {
+                let exts: Vec<_> = PaxExtensions::new(pax_data)
+                    .filter_map(|e| e.ok())
+                    .collect();
+                assert_eq!(exts[0].value_bytes(), b"first");
+                *consumed
+            }
+            other => panic!("Expected GlobalExtensions, got {:?}", other),
+        };
+
+        // Second global header
+        let event = parser.parse(&archive[consumed1..]).unwrap();
+        let consumed2 = match &event {
+            ParseEvent::GlobalExtensions { consumed, pax_data } => {
+                let exts: Vec<_> = PaxExtensions::new(pax_data)
+                    .filter_map(|e| e.ok())
+                    .collect();
+                assert_eq!(exts[0].value_bytes(), b"second");
+                *consumed
+            }
+            other => panic!("Expected GlobalExtensions, got {:?}", other),
+        };
+
+        // Then the actual file entry
+        let event = parser.parse(&archive[consumed1 + consumed2..]).unwrap();
+        assert!(matches!(event, ParseEvent::Entry { .. }));
+    }
+
+    #[test]
+    fn test_parser_global_pax_does_not_interfere_with_local_pax() {
+        // A global PAX header followed by a local PAX header should produce
+        // both events independently.
+        let mut archive = Vec::new();
+        archive.extend(make_pax_global_header(&[("mtime", b"1000000000")]));
+        archive.extend(make_pax_header(&[("path", b"overridden.txt")]));
+        archive.extend_from_slice(&make_header(b"original.txt", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+
+        // First: global extensions event
+        let event = parser.parse(&archive).unwrap();
+        let consumed = match &event {
+            ParseEvent::GlobalExtensions { consumed, .. } => *consumed,
+            other => panic!("Expected GlobalExtensions, got {:?}", other),
+        };
+
+        // Second: entry with local PAX applied
+        let event = parser.parse(&archive[consumed..]).unwrap();
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                // Local PAX should have been applied
+                assert_eq!(entry.path.as_ref(), b"overridden.txt");
+                assert!(entry.pax.is_some());
             }
             other => panic!("Expected Entry, got {:?}", other),
         }

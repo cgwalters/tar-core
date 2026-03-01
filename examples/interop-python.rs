@@ -329,6 +329,9 @@ fn parse_with_tar_core(data: &[u8]) -> Vec<EntryParams> {
             ParseEvent::SparseEntry { .. } => {
                 panic!("unexpected SparseEntry in interop test");
             }
+            ParseEvent::GlobalExtensions { consumed, .. } => {
+                offset += consumed;
+            }
             ParseEvent::End { .. } => break,
         }
     }

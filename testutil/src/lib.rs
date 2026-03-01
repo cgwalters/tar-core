@@ -108,6 +108,10 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
                 }
                 offset += padded;
             }
+            Ok(ParseEvent::GlobalExtensions { consumed, .. }) => {
+                // Global PAX headers don't represent file entries; skip them.
+                offset += consumed;
+            }
             Ok(ParseEvent::End { .. }) => break,
             Err(_) => break,
         }

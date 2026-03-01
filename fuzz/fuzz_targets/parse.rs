@@ -67,6 +67,15 @@ fn run_parser(data: &[u8], limits: Limits) {
                 offset += padded;
             }
 
+            Ok(ParseEvent::GlobalExtensions { consumed, .. }) => {
+                assert!(
+                    consumed <= input.len(),
+                    "GlobalExtensions consumed {consumed} > remaining {}",
+                    input.len()
+                );
+                offset += consumed;
+            }
+
             Ok(ParseEvent::End { consumed }) => {
                 assert!(
                     consumed <= input.len(),

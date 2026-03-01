@@ -545,6 +545,9 @@ fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
                     real_size,
                 });
             }
+            ParseEvent::GlobalExtensions { consumed, .. } => {
+                offset += consumed;
+            }
             ParseEvent::End { .. } => break,
         }
     }
