@@ -33,13 +33,13 @@ use crate::{
 ///
 /// Formats a u64 into a fixed-size byte buffer without allocating.
 /// Max u64 is 20 digits ("18446744073709551615").
-struct DecU64 {
+pub(crate) struct DecU64 {
     buf: [u8; 20],
     start: u8,
 }
 
 impl DecU64 {
-    fn new(mut value: u64) -> Self {
+    pub(crate) fn new(mut value: u64) -> Self {
         let mut buf = [0u8; 20];
         if value == 0 {
             buf[19] = b'0';
@@ -54,7 +54,7 @@ impl DecU64 {
         Self { buf, start: pos }
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.buf[self.start as usize..]
     }
 }

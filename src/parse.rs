@@ -1842,47 +1842,33 @@ mod tests {
         result
     }
 
-    /// Create a PAX extended header (type 'x') with the given key-value pairs.
-    ///
-    /// Returns the complete entry: header + padded content.
-    fn make_pax_header(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    /// Build a PAX-style header (local 'x' or global 'g') with the given key-value pairs.
+    fn make_pax_entry(name: &[u8], type_flag: u8, entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use crate::builder::DecU64;
+
         // Build PAX content: each record is "<length> <key>=<value>\n"
         let mut content = Vec::new();
         for (key, value) in entries {
-            // Format: <length> <key>=<value>\n
-            // The length includes itself, the space, key, '=', value, and '\n'
-            // We need to compute this iteratively since the length is part of the record
-
-            // Start with an estimate
-            let base_len = 1 + key.len() + 1 + value.len() + 1; // space + key + '=' + value + '\n'
-            let mut total_len = base_len + 1; // +1 for at least one digit
-
-            // Adjust for actual digit count
-            loop {
-                let digit_count = if total_len < 10 {
-                    1
-                } else if total_len < 100 {
-                    2
-                } else if total_len < 1000 {
-                    3
-                } else {
-                    4
-                };
-                let new_len = base_len + digit_count;
-                if new_len == total_len {
-                    break;
-                }
-                total_len = new_len;
+            // rest_len covers: " " + key + "=" + value + "\n"
+            let rest_len = 3 + key.len() + value.len();
+            let mut len_len = 1;
+            let mut max_len = 10;
+            while rest_len + len_len >= max_len {
+                len_len += 1;
+                max_len *= 10;
             }
-
-            let record = format!("{total_len} {key}=");
-            content.extend_from_slice(record.as_bytes());
+            let total_len = rest_len + len_len;
+            let len_dec = DecU64::new(total_len as u64);
+            content.extend_from_slice(len_dec.as_bytes());
+            content.push(b' ');
+            content.extend_from_slice(key.as_bytes());
+            content.push(b'=');
             content.extend_from_slice(value);
             content.push(b'\n');
         }
 
         let content_size = content.len();
-        let header = make_header(b"PaxHeader/file", content_size as u64, b'x');
+        let header = make_header(name, content_size as u64, type_flag);
 
         let padded = content_size.next_multiple_of(HEADER_SIZE);
         let mut result = Vec::with_capacity(HEADER_SIZE + padded);
@@ -1893,47 +1879,12 @@ mod tests {
         result
     }
 
-    /// Create a PAX global extended header (type 'g') with the given key-value pairs.
-    ///
-    /// Returns the complete entry: header + padded content.
+    fn make_pax_header(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        make_pax_entry(b"PaxHeader/file", b'x', entries)
+    }
+
     fn make_pax_global_header(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        // Build PAX content identically to make_pax_header, just with type 'g'.
-        let mut content = Vec::new();
-        for (key, value) in entries {
-            let base_len = 1 + key.len() + 1 + value.len() + 1;
-            let mut total_len = base_len + 1;
-            loop {
-                let digit_count = if total_len < 10 {
-                    1
-                } else if total_len < 100 {
-                    2
-                } else if total_len < 1000 {
-                    3
-                } else {
-                    4
-                };
-                let new_len = base_len + digit_count;
-                if new_len == total_len {
-                    break;
-                }
-                total_len = new_len;
-            }
-            let record = format!("{total_len} {key}=");
-            content.extend_from_slice(record.as_bytes());
-            content.extend_from_slice(value);
-            content.push(b'\n');
-        }
-
-        let content_size = content.len();
-        let header = make_header(b"pax_global_header", content_size as u64, b'g');
-
-        let padded = content_size.next_multiple_of(HEADER_SIZE);
-        let mut result = Vec::with_capacity(HEADER_SIZE + padded);
-        result.extend_from_slice(&header);
-        result.extend_from_slice(&content);
-        result.extend(zeroes(padded - content_size));
-
-        result
+        make_pax_entry(b"pax_global_header", b'g', entries)
     }
 
     /// Return `n` zero bytes (for end-of-archive markers, padding, etc.).
