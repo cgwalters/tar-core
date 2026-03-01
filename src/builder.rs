@@ -1025,37 +1025,7 @@ impl EntryBuilder {
 
     /// Emit a GNU LongLink/LongName pseudo-entry.
     fn emit_gnu_long_entry(&self, blocks: &mut Vec<Header>, entry_type: EntryType, data: &[u8]) {
-        // The data is null-terminated in GNU format
-        let data_with_null_len = data.len() + 1;
-
-        // Build the header for the pseudo-entry.
-        // All these values are constants or small enough to always fit.
-        let mut ext_header = HeaderBuilder::new_gnu();
-        ext_header
-            .path(GNU_LONGLINK_NAME)
-            .expect("GNU longlink name fits");
-        ext_header.mode(0).expect("zero fits");
-        ext_header.uid(0).expect("zero fits");
-        ext_header.gid(0).expect("zero fits");
-        ext_header
-            .size(data_with_null_len as u64)
-            .expect("extension data size fits");
-        ext_header.mtime(0).expect("zero fits");
-        ext_header.entry_type(entry_type);
-
-        blocks.push(ext_header.finish());
-
-        // Emit data blocks (null-terminated, padded to 512 bytes)
-        let num_data_blocks = data_with_null_len.div_ceil(HEADER_SIZE);
-        let mut data_buf = vec![0u8; num_data_blocks * HEADER_SIZE];
-        data_buf[..data.len()].copy_from_slice(data);
-        // Null terminator is already in place (vec initialized to 0)
-
-        for chunk in data_buf.chunks_exact(HEADER_SIZE) {
-            blocks.push(*Header::from_bytes(
-                chunk.try_into().expect("chunks_exact guarantees size"),
-            ));
-        }
+        blocks.extend(gnu_long_entry_blocks(entry_type, data));
     }
 
     /// Build PAX extension data for long paths/links and custom extensions.
@@ -1176,6 +1146,67 @@ impl std::fmt::Debug for EntryBuilder {
             .field("header", &self.header)
             .finish()
     }
+}
+
+/// Build a GNU LongLink or LongName pseudo-entry as a sequence of
+/// 512-byte header blocks.
+///
+/// This produces the same blocks that [`EntryBuilder`] emits for a long
+/// path or link target, but as a standalone function for callers that
+/// manage the main header separately.
+///
+/// The `entry_type` should be [`EntryType::GnuLongName`] or
+/// [`EntryType::GnuLongLink`].
+#[must_use]
+pub fn gnu_long_entry_blocks(entry_type: EntryType, data: &[u8]) -> Vec<Header> {
+    // The data is null-terminated in GNU format
+    let data_with_null_len = data.len() + 1;
+
+    // Build the header for the pseudo-entry.
+    // All these values are constants or small enough to always fit.
+    let mut ext_header = HeaderBuilder::new_gnu();
+    ext_header
+        .path(GNU_LONGLINK_NAME)
+        .expect("GNU longlink name fits");
+    ext_header.mode(0).expect("zero fits");
+    ext_header.uid(0).expect("zero fits");
+    ext_header.gid(0).expect("zero fits");
+    ext_header
+        .size(data_with_null_len as u64)
+        .expect("extension data size fits");
+    ext_header.mtime(0).expect("zero fits");
+    ext_header.entry_type(entry_type);
+
+    let mut blocks = Vec::new();
+    blocks.push(ext_header.finish());
+
+    // Emit data blocks (null-terminated, padded to 512 bytes)
+    let num_data_blocks = data_with_null_len.div_ceil(HEADER_SIZE);
+    let mut data_buf = vec![0u8; num_data_blocks * HEADER_SIZE];
+    data_buf[..data.len()].copy_from_slice(data);
+    // Null terminator is already in place (vec initialized to 0)
+
+    for chunk in data_buf.chunks_exact(HEADER_SIZE) {
+        blocks.push(*Header::from_bytes(
+            chunk.try_into().expect("chunks_exact guarantees size"),
+        ));
+    }
+
+    blocks
+}
+
+/// Build a GNU LongLink or LongName pseudo-entry as contiguous bytes.
+///
+/// This is a convenience wrapper around [`gnu_long_entry_blocks`] that
+/// flattens the result into a single byte vector.
+#[must_use]
+pub fn gnu_long_entry_bytes(entry_type: EntryType, data: &[u8]) -> Vec<u8> {
+    let blocks = gnu_long_entry_blocks(entry_type, data);
+    let mut out = Vec::with_capacity(blocks.len() * HEADER_SIZE);
+    for block in &blocks {
+        out.extend_from_slice(block.as_bytes());
+    }
+    out
 }
 
 /// Calculate the number of 512-byte blocks needed to store `size` bytes.
