@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 #![cfg_attr(not(feature = "std"), no_std)]
 //! Sans-IO tar parsing for sync and async runtimes.
 //!
@@ -19,46 +20,6 @@
 //! - **Old (POSIX.1-1988)**: The original Unix tar format with basic fields
 //! - **UStar (POSIX.1-2001)**: Adds `magic`/`version`, user/group names, and path prefix
 //! - **GNU tar**: Extends UStar with sparse file support and long name/link extensions
-//!
-//! # Header Field Layout
-//!
-//! All tar headers are 512 bytes. The common fields (offsets 0-156) are shared:
-//!
-//! | Offset | Size | Field     | Description                              |
-//! |--------|------|-----------|------------------------------------------|
-//! | 0      | 100  | name      | File path (null-terminated if < 100)     |
-//! | 100    | 8    | mode      | File mode in octal ASCII                 |
-//! | 108    | 8    | uid       | Owner user ID in octal ASCII             |
-//! | 116    | 8    | gid       | Owner group ID in octal ASCII            |
-//! | 124    | 12   | size      | File size in octal ASCII                 |
-//! | 136    | 12   | mtime     | Modification time (Unix epoch, octal)    |
-//! | 148    | 8    | cksum     | Header checksum in octal ASCII           |
-//! | 156    | 1    | typeflag  | Entry type (see [`EntryType`])           |
-//! | 157    | 100  | linkname  | Link target for hard/symbolic links      |
-//!
-//! **UStar extension** (offsets 257-500):
-//!
-//! | Offset | Size | Field     |
-//! |--------|------|-----------|
-//! | 257    | 6    | magic     | "ustar\0"                                |
-//! | 263    | 2    | version   | "00"                                     |
-//! | 265    | 32   | uname     | Owner user name                          |
-//! | 297    | 32   | gname     | Owner group name                         |
-//! | 329    | 8    | dev_major | Device major number                      |
-//! | 337    | 8    | dev_minor | Device minor number                      |
-//! | 345    | 155  | prefix    | Path prefix for long names               |
-//!
-//! **GNU extension** (offsets 257-500, replaces prefix):
-//!
-//! | Offset | Size | Field       |
-//! |--------|------|-------------|
-//! | 345    | 12   | atime       | Access time                              |
-//! | 357    | 12   | ctime       | Change time                              |
-//! | 369    | 12   | offset      | Multivolume offset                       |
-//! | 381    | 4    | longnames   | (deprecated)                             |
-//! | 386    | 96   | sparse      | 4 × 24-byte sparse descriptors           |
-//! | 482    | 1    | isextended  | More sparse headers follow               |
-//! | 483    | 12   | realsize    | Real size of sparse file                 |
 //!
 //! # Example
 //!
@@ -96,7 +57,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use thiserror::Error;
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 /// Size of a tar header block in bytes.
 pub const HEADER_SIZE: usize = 512;
@@ -182,18 +143,7 @@ pub struct OldHeader {
 
 impl Default for OldHeader {
     fn default() -> Self {
-        Self {
-            name: [0u8; 100],
-            mode: [0u8; 8],
-            uid: [0u8; 8],
-            gid: [0u8; 8],
-            size: [0u8; 12],
-            mtime: [0u8; 12],
-            cksum: [0u8; 8],
-            linkflag: [0],
-            linkname: [0u8; 100],
-            pad: [0u8; 255],
-        }
+        Self::new_zeroed()
     }
 }
 
@@ -253,25 +203,7 @@ pub struct UstarHeader {
 
 impl Default for UstarHeader {
     fn default() -> Self {
-        let mut header = Self {
-            name: [0u8; 100],
-            mode: [0u8; 8],
-            uid: [0u8; 8],
-            gid: [0u8; 8],
-            size: [0u8; 12],
-            mtime: [0u8; 12],
-            cksum: [0u8; 8],
-            typeflag: [0],
-            linkname: [0u8; 100],
-            magic: [0u8; 6],
-            version: [0u8; 2],
-            uname: [0u8; 32],
-            gname: [0u8; 32],
-            dev_major: [0u8; 8],
-            dev_minor: [0u8; 8],
-            prefix: [0u8; 155],
-            pad: [0u8; 12],
-        };
+        let mut header = Self::new_zeroed();
         header.magic.copy_from_slice(USTAR_MAGIC);
         header.version.copy_from_slice(USTAR_VERSION);
         header
@@ -457,32 +389,7 @@ pub struct GnuHeader {
 
 impl Default for GnuHeader {
     fn default() -> Self {
-        let mut header = Self {
-            name: [0u8; 100],
-            mode: [0u8; 8],
-            uid: [0u8; 8],
-            gid: [0u8; 8],
-            size: [0u8; 12],
-            mtime: [0u8; 12],
-            cksum: [0u8; 8],
-            typeflag: [0],
-            linkname: [0u8; 100],
-            magic: [0u8; 6],
-            version: [0u8; 2],
-            uname: [0u8; 32],
-            gname: [0u8; 32],
-            dev_major: [0u8; 8],
-            dev_minor: [0u8; 8],
-            atime: [0u8; 12],
-            ctime: [0u8; 12],
-            offset: [0u8; 12],
-            longnames: [0u8; 4],
-            unused: [0],
-            sparse: [GnuSparseHeader::default(); 4],
-            isextended: [0],
-            realsize: [0u8; 12],
-            pad: [0u8; 17],
-        };
+        let mut header = Self::new_zeroed();
         header.magic.copy_from_slice(GNU_MAGIC);
         header.version.copy_from_slice(GNU_VERSION);
         header
@@ -904,8 +811,9 @@ impl Header {
         let mut header = Self {
             bytes: [0u8; HEADER_SIZE],
         };
-        header.bytes[257..263].copy_from_slice(USTAR_MAGIC);
-        header.bytes[263..265].copy_from_slice(USTAR_VERSION);
+        let ustar = header.as_ustar_mut();
+        ustar.magic.copy_from_slice(USTAR_MAGIC);
+        ustar.version.copy_from_slice(USTAR_VERSION);
         header
     }
 
@@ -915,8 +823,9 @@ impl Header {
         let mut header = Self {
             bytes: [0u8; HEADER_SIZE],
         };
-        header.bytes[257..263].copy_from_slice(GNU_MAGIC);
-        header.bytes[263..265].copy_from_slice(GNU_VERSION);
+        let gnu = header.as_gnu_mut();
+        gnu.magic.copy_from_slice(GNU_MAGIC);
+        gnu.version.copy_from_slice(GNU_VERSION);
         header
     }
 
@@ -1037,19 +946,21 @@ impl Header {
     /// Check if this header uses UStar format.
     #[must_use]
     pub fn is_ustar(&self) -> bool {
-        self.bytes[257..263] == *USTAR_MAGIC && self.bytes[263..265] == *USTAR_VERSION
+        let h = self.as_ustar();
+        h.magic == *USTAR_MAGIC && h.version == *USTAR_VERSION
     }
 
     /// Check if this header uses GNU tar format.
     #[must_use]
     pub fn is_gnu(&self) -> bool {
-        self.bytes[257..263] == *GNU_MAGIC && self.bytes[263..265] == *GNU_VERSION
+        let h = self.as_gnu();
+        h.magic == *GNU_MAGIC && h.version == *GNU_VERSION
     }
 
     /// Get the entry type.
     #[must_use]
     pub fn entry_type(&self) -> EntryType {
-        EntryType::from_byte(self.bytes[156])
+        EntryType::from_byte(self.as_ustar().typeflag[0])
     }
 
     /// Get the entry size (file content length) in bytes.
@@ -1058,7 +969,7 @@ impl Header {
     ///
     /// Returns [`HeaderError::InvalidOctal`] if the size field is not valid.
     pub fn entry_size(&self) -> Result<u64> {
-        parse_numeric(&self.bytes[124..136])
+        parse_numeric(&self.as_ustar().size)
     }
 
     /// Get the file mode (permissions).
@@ -1067,7 +978,7 @@ impl Header {
     ///
     /// Returns [`HeaderError::InvalidOctal`] if the mode field is not valid.
     pub fn mode(&self) -> Result<u32> {
-        parse_numeric(&self.bytes[100..108]).map(|v| v as u32)
+        parse_numeric(&self.as_ustar().mode).map(|v| v as u32)
     }
 
     /// Get the owner user ID.
@@ -1076,7 +987,7 @@ impl Header {
     ///
     /// Returns [`HeaderError::InvalidOctal`] if the uid field is not valid.
     pub fn uid(&self) -> Result<u64> {
-        parse_numeric(&self.bytes[108..116])
+        parse_numeric(&self.as_ustar().uid)
     }
 
     /// Get the owner group ID.
@@ -1085,7 +996,7 @@ impl Header {
     ///
     /// Returns [`HeaderError::InvalidOctal`] if the gid field is not valid.
     pub fn gid(&self) -> Result<u64> {
-        parse_numeric(&self.bytes[116..124])
+        parse_numeric(&self.as_ustar().gid)
     }
 
     /// Get the modification time as a Unix timestamp.
@@ -1094,7 +1005,7 @@ impl Header {
     ///
     /// Returns [`HeaderError::InvalidOctal`] if the mtime field is not valid.
     pub fn mtime(&self) -> Result<u64> {
-        parse_numeric(&self.bytes[136..148])
+        parse_numeric(&self.as_ustar().mtime)
     }
 
     /// Get the raw path bytes from the header.
@@ -1104,13 +1015,13 @@ impl Header {
     /// that should be prepended.
     #[must_use]
     pub fn path_bytes(&self) -> &[u8] {
-        truncate_null(&self.bytes[0..100])
+        truncate_null(&self.as_ustar().name)
     }
 
     /// Get the raw link name bytes.
     #[must_use]
     pub fn link_name_bytes(&self) -> &[u8] {
-        truncate_null(&self.bytes[157..257])
+        truncate_null(&self.as_ustar().linkname)
     }
 
     /// Get the device major number (for character/block devices).
@@ -1124,7 +1035,7 @@ impl Header {
         if !self.is_ustar() && !self.is_gnu() {
             return Ok(None);
         }
-        parse_octal(&self.bytes[329..337]).map(|v| Some(v as u32))
+        parse_octal(&self.as_ustar().dev_major).map(|v| Some(v as u32))
     }
 
     /// Get the device minor number (for character/block devices).
@@ -1138,7 +1049,7 @@ impl Header {
         if !self.is_ustar() && !self.is_gnu() {
             return Ok(None);
         }
-        parse_octal(&self.bytes[337..345]).map(|v| Some(v as u32))
+        parse_octal(&self.as_ustar().dev_minor).map(|v| Some(v as u32))
     }
 
     /// Get the owner user name.
@@ -1149,7 +1060,7 @@ impl Header {
         if !self.is_ustar() && !self.is_gnu() {
             return None;
         }
-        Some(truncate_null(&self.bytes[265..297]))
+        Some(truncate_null(&self.as_ustar().uname))
     }
 
     /// Get the owner group name.
@@ -1160,7 +1071,7 @@ impl Header {
         if !self.is_ustar() && !self.is_gnu() {
             return None;
         }
-        Some(truncate_null(&self.bytes[297..329]))
+        Some(truncate_null(&self.as_ustar().gname))
     }
 
     /// Get the UStar prefix field for long paths.
@@ -1171,7 +1082,7 @@ impl Header {
         if !self.is_ustar() {
             return None;
         }
-        Some(truncate_null(&self.bytes[345..500]))
+        Some(truncate_null(&self.as_ustar().prefix))
     }
 
     /// Verify the header checksum.
@@ -1184,7 +1095,7 @@ impl Header {
     /// Returns [`HeaderError::ChecksumMismatch`] if the checksum is invalid,
     /// or [`HeaderError::InvalidOctal`] if the stored checksum cannot be parsed.
     pub fn verify_checksum(&self) -> Result<()> {
-        let expected = parse_octal(&self.bytes[148..156])?;
+        let expected = parse_octal(&self.as_ustar().cksum)?;
         let computed = self.compute_checksum();
         if expected == computed {
             Ok(())
@@ -1353,7 +1264,7 @@ impl Header {
 
     /// Set the entry type (byte 156).
     pub fn set_entry_type(&mut self, ty: EntryType) {
-        self.bytes[156] = ty.to_byte();
+        self.as_ustar_mut().typeflag[0] = ty.to_byte();
     }
 
     /// Compute and set the header checksum (bytes 148-156).
@@ -1380,14 +1291,15 @@ impl Header {
     ///
     /// Returns an error if the path is longer than 100 bytes.
     pub fn set_path(&mut self, path: &[u8]) -> Result<()> {
-        if path.len() > 100 {
+        if path.len() > self.as_ustar().name.len() {
             return Err(HeaderError::FieldOverflow {
-                field_len: 100,
+                field_len: self.as_ustar().name.len(),
                 detail: format!("{}-byte path", path.len()),
             });
         }
-        self.bytes[0..100].fill(0);
-        self.bytes[0..path.len()].copy_from_slice(path);
+        let name = &mut self.as_ustar_mut().name;
+        name.fill(0);
+        name[..path.len()].copy_from_slice(path);
         Ok(())
     }
 
@@ -1397,14 +1309,15 @@ impl Header {
     ///
     /// Returns an error if the link name is longer than 100 bytes.
     pub fn set_link_name(&mut self, link: &[u8]) -> Result<()> {
-        if link.len() > 100 {
+        if link.len() > self.as_ustar().linkname.len() {
             return Err(HeaderError::FieldOverflow {
-                field_len: 100,
+                field_len: self.as_ustar().linkname.len(),
                 detail: format!("{}-byte link name", link.len()),
             });
         }
-        self.bytes[157..257].fill(0);
-        self.bytes[157..157 + link.len()].copy_from_slice(link);
+        let linkname = &mut self.as_ustar_mut().linkname;
+        linkname.fill(0);
+        linkname[..link.len()].copy_from_slice(link);
         Ok(())
     }
 
@@ -1414,14 +1327,15 @@ impl Header {
     ///
     /// Returns an error if the username is longer than 32 bytes.
     pub fn set_username(&mut self, name: &[u8]) -> Result<()> {
-        if name.len() > 32 {
+        if name.len() > self.as_ustar().uname.len() {
             return Err(HeaderError::FieldOverflow {
-                field_len: 32,
+                field_len: self.as_ustar().uname.len(),
                 detail: format!("{}-byte username", name.len()),
             });
         }
-        self.bytes[265..297].fill(0);
-        self.bytes[265..265 + name.len()].copy_from_slice(name);
+        let uname = &mut self.as_ustar_mut().uname;
+        uname.fill(0);
+        uname[..name.len()].copy_from_slice(name);
         Ok(())
     }
 
@@ -1431,14 +1345,15 @@ impl Header {
     ///
     /// Returns an error if the group name is longer than 32 bytes.
     pub fn set_groupname(&mut self, name: &[u8]) -> Result<()> {
-        if name.len() > 32 {
+        if name.len() > self.as_ustar().gname.len() {
             return Err(HeaderError::FieldOverflow {
-                field_len: 32,
+                field_len: self.as_ustar().gname.len(),
                 detail: format!("{}-byte group name", name.len()),
             });
         }
-        self.bytes[297..329].fill(0);
-        self.bytes[297..297 + name.len()].copy_from_slice(name);
+        let gname = &mut self.as_ustar_mut().gname;
+        gname.fill(0);
+        gname[..name.len()].copy_from_slice(name);
         Ok(())
     }
 
