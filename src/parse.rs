@@ -802,7 +802,11 @@ impl Parser {
             EntryType::XHeader if is_extension_format => {
                 self.handle_extension(input, size, padded_size, ExtensionKind::Pax)
             }
-            EntryType::XGlobalHeader if is_extension_format => {
+            // Global PAX headers (type 'g') are defined by POSIX
+            // independently of the UStar/GNU magic, so we always handle
+            // them here. Routing through emit_entry would fail because
+            // global headers have arbitrary metadata fields.
+            EntryType::XGlobalHeader => {
                 // Check size limit (same as local PAX headers)
                 if size > self.limits.max_pax_size {
                     return Err(ParseError::PaxTooLarge {
