@@ -169,6 +169,28 @@ pub fn parse_tar_rs(data: &[u8]) -> Vec<OwnedEntry> {
         let header = entry.header().clone();
         let entry_type = header.entry_type().as_byte();
 
+        let path = entry.path_bytes().into_owned();
+        let size = entry.size();
+
+        // Require that numeric fields parse successfully.  tar-core
+        // treats invalid numeric fields as hard errors, so if tar-rs
+        // silently defaulted to 0 we'd get false mismatches.
+        //
+        // These checks must come before ALL skip logic (metadata types,
+        // empty paths) so both parsers stop on the same invalid fields.
+        let Ok(mode) = header.mode() else { break };
+        let Ok(uid) = header.uid() else { break };
+        let Ok(gid) = header.gid() else { break };
+        let Ok(mtime) = header.mtime() else { break };
+        // tar-rs normally uses unwrap_or(None) for device fields, but
+        // tar-core propagates errors. Break here to match.
+        let Ok(dev_major) = header.device_major() else {
+            break;
+        };
+        let Ok(dev_minor) = header.device_minor() else {
+            break;
+        };
+
         // Skip metadata-only entry types that tar-core handles internally
         // (GNU long name/link, PAX headers, global PAX headers).
         match header.entry_type() {
@@ -179,22 +201,11 @@ pub fn parse_tar_rs(data: &[u8]) -> Vec<OwnedEntry> {
             _ => {}
         }
 
-        let path = entry.path_bytes().into_owned();
-        let size = entry.size();
-
         // tar-core rejects entries with empty paths; skip them here
         // to match.
         if path.is_empty() {
             continue;
         }
-
-        // Require that numeric fields parse successfully.  tar-core
-        // treats invalid numeric fields as hard errors, so if tar-rs
-        // silently defaulted to 0 we'd get false mismatches.
-        let Ok(mode) = header.mode() else { break };
-        let Ok(uid) = header.uid() else { break };
-        let Ok(gid) = header.gid() else { break };
-        let Ok(mtime) = header.mtime() else { break };
         // entry.link_name_bytes() applies PAX linkpath and GNU long link
         // overrides, unlike header.link_name_bytes() which is raw.
         let link_target = entry
@@ -240,9 +251,6 @@ pub fn parse_tar_rs(data: &[u8]) -> Vec<OwnedEntry> {
         if entry.read_exact(&mut content).is_err() {
             break;
         }
-
-        let dev_major = header.device_major().unwrap_or(None);
-        let dev_minor = header.device_minor().unwrap_or(None);
 
         results.push(OwnedEntry {
             entry_type,
