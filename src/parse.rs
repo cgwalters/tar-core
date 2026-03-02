@@ -1307,8 +1307,14 @@ impl Parser {
         let mut mtime = header.mtime()?;
         let mut entry_size = size;
         let mut xattrs = Vec::new();
-        let mut uname: Option<Cow<'a, [u8]>> = header.username().map(Cow::Borrowed);
-        let mut gname: Option<Cow<'a, [u8]>> = header.groupname().map(Cow::Borrowed);
+        let mut uname: Option<Cow<'a, [u8]>> = header
+            .username()
+            .filter(|b| !b.is_empty())
+            .map(Cow::Borrowed);
+        let mut gname: Option<Cow<'a, [u8]>> = header
+            .groupname()
+            .filter(|b| !b.is_empty())
+            .map(Cow::Borrowed);
 
         // Handle UStar prefix for path
         if let Some(prefix) = header.prefix() {
