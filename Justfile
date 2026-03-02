@@ -27,8 +27,8 @@ interop:
 # Run all tests
 test-all: unit interop
 
-# Full CI check (format, lint, test)
-ci: check unit
+# Full CI check (format, lint, test, fuzz)
+ci: check unit fuzz-all
 
 # Run Kani formal verification proofs (install: cargo install --locked kani-verifier && cargo kani setup)
 kani:
@@ -42,13 +42,32 @@ kani-proof name:
 kani-list:
     cargo kani list
 
-# Run a cargo-fuzz target (e.g., `just fuzz parse`, `just fuzz roundtrip -- -max_total_time=60`)
+# Run a single fuzz target (e.g., `just fuzz parse`, `just fuzz roundtrip -- -max_total_time=60`)
 fuzz target *ARGS:
     cargo +nightly fuzz run {{target}} {{ARGS}}
 
+# Run all fuzz targets for a given duration each (default: 2 minutes).
+# Fuzzer output is redirected to target/fuzz-logs/; on failure the full log is printed.
+fuzz-all seconds="120":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p target/fuzz-logs
+    for target in $(cd fuzz && cargo +nightly fuzz list); do
+        echo "--- Fuzzing $target for {{seconds}}s ---"
+        log="target/fuzz-logs/$target.log"
+        if cargo +nightly fuzz run "$target" -- -max_total_time={{seconds}} > "$log" 2>&1; then
+            echo "  $target: OK"
+            tail -1 "$log"
+        else
+            echo "  $target: FAILED"
+            cat "$log"
+            exit 1
+        fi
+    done
+
 # List available fuzz targets
 fuzz-list:
-    cargo fuzz list
+    cd fuzz && cargo +nightly fuzz list
 
 # Generate seed corpus for the parse fuzz target
 generate-corpus:
