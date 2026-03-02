@@ -1562,11 +1562,17 @@ impl Parser {
         // Clear pending metadata
         self.pending.clear();
 
-        // Normalize: empty link target is semantically equivalent to no link
-        // target.  PAX `linkpath` and GNU long link can set an empty value that
+        // Normalize: empty optional byte fields are semantically equivalent to
+        // absent.  PAX overrides and GNU long link can set empty values that
         // would otherwise surface as `Some([])` instead of `None`.
         if link_target.as_ref().is_some_and(|v| v.is_empty()) {
             link_target = None;
+        }
+        if uname.as_ref().is_some_and(|v| v.is_empty()) {
+            uname = None;
+        }
+        if gname.as_ref().is_some_and(|v| v.is_empty()) {
+            gname = None;
         }
 
         // Reject entries with empty paths

@@ -225,9 +225,15 @@ pub fn parse_tar_rs(data: &[u8]) -> Vec<OwnedEntry> {
                     if let Some(attr_name) = key.strip_prefix(PAX_SCHILY_XATTR) {
                         xattrs.push((attr_name.as_bytes().to_vec(), ext.value_bytes().to_vec()));
                     } else if key == "uname" {
-                        uname = Some(ext.value_bytes().to_vec());
+                        let v = ext.value_bytes();
+                        if !v.is_empty() {
+                            uname = Some(v.to_vec());
+                        }
                     } else if key == "gname" {
-                        gname = Some(ext.value_bytes().to_vec());
+                        let v = ext.value_bytes();
+                        if !v.is_empty() {
+                            gname = Some(v.to_vec());
+                        }
                     }
                 }
             }
