@@ -66,17 +66,13 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
 
                 let size = entry.size;
 
-                // Require the full padded content to be present, matching
-                // tar-rs which errors (and stops iteration) on truncated
-                // content.  Without this, tar-core would happily return
-                // the entry from the header alone while tar-rs returns
-                // nothing, causing spurious differential mismatches.
-                let padded = (size as usize).next_multiple_of(HEADER_SIZE);
-                if offset.saturating_add(padded) > data.len() {
+                // Require enough data for the content bytes we'll actually
+                // read. tar-rs reads `size` bytes (via read_exact) but
+                // does not require the padding to be present.
+                let read_size = size.min(MAX_CONTENT_READ) as usize;
+                if offset.saturating_add(read_size) > data.len() {
                     break;
                 }
-
-                let read_size = size.min(MAX_CONTENT_READ) as usize;
                 let content = data[offset..offset + read_size].to_vec();
 
                 let xattrs: Vec<(Vec<u8>, Vec<u8>)> = entry
@@ -102,6 +98,11 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
                     content,
                 });
 
+                // Advance past content + padding to reach the next header.
+                let padded = (size as usize).next_multiple_of(HEADER_SIZE);
+                if offset.saturating_add(padded) > data.len() {
+                    break;
+                }
                 offset += padded;
             }
             Ok(ParseEvent::GlobalExtensions { consumed, .. }) => {
@@ -133,14 +134,34 @@ pub fn parse_tar_rs(data: &[u8]) -> Vec<OwnedEntry> {
             Err(_) => break,
         };
         let header = entry.header().clone();
+        let entry_type = header.entry_type().as_byte();
+
+        // Skip metadata-only entry types that tar-core handles internally
+        // (GNU long name/link, PAX headers, global PAX headers).
+        match header.entry_type() {
+            tar::EntryType::GNULongName
+            | tar::EntryType::GNULongLink
+            | tar::EntryType::XHeader
+            | tar::EntryType::XGlobalHeader => continue,
+            _ => {}
+        }
 
         let path = entry.path_bytes().into_owned();
         let size = entry.size();
-        let entry_type = header.entry_type().as_byte();
-        let mode = header.mode().unwrap_or(0);
-        let uid = header.uid().unwrap_or(0);
-        let gid = header.gid().unwrap_or(0);
-        let mtime = header.mtime().unwrap_or(0);
+
+        // tar-core rejects entries with empty paths; skip them here
+        // to match.
+        if path.is_empty() {
+            continue;
+        }
+
+        // Require that numeric fields parse successfully.  tar-core
+        // treats invalid numeric fields as hard errors, so if tar-rs
+        // silently defaulted to 0 we'd get false mismatches.
+        let Ok(mode) = header.mode() else { break };
+        let Ok(uid) = header.uid() else { break };
+        let Ok(gid) = header.gid() else { break };
+        let Ok(mtime) = header.mtime() else { break };
         // entry.link_name_bytes() applies PAX linkpath and GNU long link
         // overrides, unlike header.link_name_bytes() which is raw.
         let link_target = entry

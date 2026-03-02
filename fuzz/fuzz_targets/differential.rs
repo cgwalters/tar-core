@@ -11,57 +11,60 @@
 use libfuzzer_sys::fuzz_target;
 use tar_core_testutil::{parse_tar_core, parse_tar_rs, OwnedEntry};
 
+/// Dump the raw 512-byte headers from the (post-fixup) data to stderr.
+fn dump_headers(data: &[u8]) {
+    let mut offset = 0;
+    let mut i = 0;
+    while offset + 512 <= data.len() {
+        let block = &data[offset..offset + 512];
+        if block.iter().all(|&b| b == 0) {
+            eprintln!("block[{i}] @{offset}: <all zeros>");
+            offset += 512;
+            i += 1;
+            continue;
+        }
+        let header = tar_core::Header::from_bytes(block.try_into().unwrap());
+        eprintln!("block[{i}] @{offset}: {header:?}");
+        offset += 512;
+        i += 1;
+    }
+}
+
 /// Compare entries parsed by tar-rs and tar-core, asserting equivalence.
 ///
 /// tar-core is intentionally more lenient than tar-rs in some cases (e.g.
 /// all-null numeric fields are accepted as 0), so we only require that
 /// tar-core parses *at least* as many entries as tar-rs and that those
 /// entries match.
-fn compare_entries(tar_rs_entries: &[OwnedEntry], tar_core_entries: &[OwnedEntry]) {
-    assert!(
-        tar_core_entries.len() >= tar_rs_entries.len(),
-        "tar-core parsed fewer entries than tar-rs: tar-core={} tar-rs={}",
-        tar_core_entries.len(),
-        tar_rs_entries.len(),
-    );
+fn compare_entries(data: &[u8], tar_rs_entries: &[OwnedEntry], tar_core_entries: &[OwnedEntry]) {
+    if tar_core_entries.len() < tar_rs_entries.len() {
+        eprintln!(
+            "entry count mismatch: tar-core={} tar-rs={}",
+            tar_core_entries.len(),
+            tar_rs_entries.len()
+        );
+        dump_headers(data);
+        for (i, e) in tar_rs_entries.iter().enumerate() {
+            eprintln!("tar-rs  [{i}]: {e:?}");
+        }
+        for (i, e) in tar_core_entries.iter().enumerate() {
+            eprintln!("tar-core[{i}]: {e:?}");
+        }
+        panic!(
+            "tar-core parsed fewer entries than tar-rs: tar-core={} tar-rs={}",
+            tar_core_entries.len(),
+            tar_rs_entries.len(),
+        );
+    }
 
     for (i, (rs, core)) in tar_rs_entries.iter().zip(tar_core_entries).enumerate() {
-        assert_eq!(
-            rs.path,
-            core.path,
-            "path mismatch at entry {i}: tar-rs={:?} tar-core={:?}",
-            String::from_utf8_lossy(&rs.path),
-            String::from_utf8_lossy(&core.path),
-        );
-        assert_eq!(rs.size, core.size, "size mismatch at entry {i}");
-        assert_eq!(
-            rs.entry_type, core.entry_type,
-            "entry_type mismatch at entry {i}"
-        );
-        assert_eq!(rs.mode, core.mode, "mode mismatch at entry {i}");
-        assert_eq!(rs.uid, core.uid, "uid mismatch at entry {i}");
-        assert_eq!(rs.gid, core.gid, "gid mismatch at entry {i}");
-        assert_eq!(rs.mtime, core.mtime, "mtime mismatch at entry {i}");
-        assert_eq!(
-            rs.link_target, core.link_target,
-            "link_target mismatch at entry {i}"
-        );
-        assert_eq!(rs.uname, core.uname, "uname mismatch at entry {i}");
-        assert_eq!(rs.gname, core.gname, "gname mismatch at entry {i}");
-        assert_eq!(
-            rs.dev_major, core.dev_major,
-            "dev_major mismatch at entry {i}"
-        );
-        assert_eq!(
-            rs.dev_minor, core.dev_minor,
-            "dev_minor mismatch at entry {i}"
-        );
-        assert_eq!(
-            rs.content, core.content,
-            "content mismatch at entry {i} (size={})",
-            rs.size,
-        );
-        assert_eq!(rs.xattrs, core.xattrs, "xattr mismatch at entry {i}");
+        if rs != core {
+            eprintln!("mismatch at entry {i}:");
+            dump_headers(data);
+            eprintln!("  tar-rs:   {rs:?}");
+            eprintln!("  tar-core: {core:?}");
+            panic!("entry {i} differs between tar-rs and tar-core");
+        }
     }
 }
 
@@ -141,10 +144,10 @@ fuzz_target!(|data: &[u8]| {
         fixup_checksums(&mut data);
         let tar_rs_entries = parse_tar_rs(&data);
         let tar_core_entries = parse_tar_core(&data);
-        compare_entries(&tar_rs_entries, &tar_core_entries);
+        compare_entries(&data, &tar_rs_entries, &tar_core_entries);
     } else {
         let tar_rs_entries = parse_tar_rs(data);
         let tar_core_entries = parse_tar_core(data);
-        compare_entries(&tar_rs_entries, &tar_core_entries);
+        compare_entries(data, &tar_rs_entries, &tar_core_entries);
     }
 });

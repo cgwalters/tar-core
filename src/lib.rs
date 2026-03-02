@@ -1456,17 +1456,23 @@ impl OctU64 {
 /// Returns [`HeaderError::InvalidOctal`] if the field contains invalid
 /// characters (anything other than spaces, digits 0-7, or null bytes).
 pub(crate) fn parse_octal(bytes: &[u8]) -> Result<u64> {
-    // Tar octal fields are padded with leading spaces and terminated by
-    // spaces or null bytes. Strip both ends to get the digit run.
-    let trimmed = bytes
+    // Tar octal fields are padded with leading spaces/nulls and terminated
+    // by spaces, tabs, or null bytes. We first truncate at the first null
+    // (matching how C-string fields work in tar), then trim ASCII
+    // whitespace from both ends to isolate the digit run.
+    let truncated = match bytes.iter().position(|&b| b == 0) {
+        Some(i) => &bytes[..i],
+        None => bytes,
+    };
+    let trimmed = truncated
         .iter()
-        .position(|&b| b != b' ')
+        .position(|&b| !b.is_ascii_whitespace())
         .map(|start| {
-            let rest = &bytes[start..];
+            let rest = &truncated[start..];
             let end = rest
                 .iter()
-                .position(|&b| b == b' ' || b == b'\0')
-                .unwrap_or(rest.len());
+                .rposition(|&b| !b.is_ascii_whitespace())
+                .map_or(0, |p| p + 1);
             &rest[..end]
         })
         .unwrap_or(&[]);
