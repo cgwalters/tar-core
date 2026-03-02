@@ -815,7 +815,9 @@ impl Parser {
                     });
                 }
 
-                let total_size = HEADER_SIZE as u64 + padded_size;
+                let total_size = (HEADER_SIZE as u64)
+                    .checked_add(padded_size)
+                    .ok_or(ParseError::InvalidSize(size))?;
                 if (input.len() as u64) < total_size {
                     return Ok(ParseEvent::NeedData {
                         min_bytes: total_size as usize,
@@ -898,7 +900,9 @@ impl Parser {
             });
         }
 
-        let total_size = HEADER_SIZE as u64 + padded_size;
+        let total_size = (HEADER_SIZE as u64)
+            .checked_add(padded_size)
+            .ok_or(ParseError::InvalidSize(size))?;
         if (input.len() as u64) < total_size {
             return Ok(ParseEvent::NeedData {
                 min_bytes: total_size as usize,
@@ -1557,6 +1561,19 @@ impl Parser {
 
         // Clear pending metadata
         self.pending.clear();
+
+        // Normalize: empty optional byte fields are semantically equivalent to
+        // absent.  PAX overrides and GNU long link can set empty values that
+        // would otherwise surface as `Some([])` instead of `None`.
+        if link_target.as_ref().is_some_and(|v| v.is_empty()) {
+            link_target = None;
+        }
+        if uname.as_ref().is_some_and(|v| v.is_empty()) {
+            uname = None;
+        }
+        if gname.as_ref().is_some_and(|v| v.is_empty()) {
+            gname = None;
+        }
 
         // Reject entries with empty paths
         if path.is_empty() && !self.allow_empty_path {

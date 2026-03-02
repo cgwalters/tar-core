@@ -1,0 +1,44 @@
+name: Extended Fuzzing
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: short
+
+jobs:
+  fuzz-extended:
+    name: Fuzz (extended)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Generate seed corpus
+        run: cargo run --manifest-path fuzz/Cargo.toml --bin generate-corpus
+      - name: Fuzz all targets (15 minutes each)
+        run: |
+          mkdir -p fuzz-logs
+          for target in $(cargo +nightly fuzz list); do
+            echo "--- Fuzzing $target (15 min) ---"
+            cargo +nightly fuzz run "$target" -- -max_total_time=900 \
+              > "fuzz-logs/$target.log" 2>&1 \
+              && echo "  $target: OK" \
+              || { echo "::error::Fuzzer $target failed"; cat "fuzz-logs/$target.log"; exit 1; }
+            tail -1 "fuzz-logs/$target.log"
+          done
+        working-directory: fuzz

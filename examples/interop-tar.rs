@@ -21,8 +21,9 @@ use arbitrary::{Arbitrary, Unstructured};
 use tempfile::TempDir;
 
 use tar_core::builder::EntryBuilder;
-use tar_core::parse::{Limits, ParseEvent, Parser};
+use tar_core::parse::Limits;
 use tar_core::{EntryType, HEADER_SIZE};
+use tar_core_testutil::{parse_tar_core_with_limits, OwnedEntry};
 
 // =============================================================================
 // Test parameters
@@ -230,57 +231,6 @@ fn build_tar_core_archive(entries: &[EntryParams], format: &str) -> Vec<u8> {
     archive
 }
 
-/// Parse a tar archive using tar-core's sans-IO parser.
-fn parse_tar_core_archive(data: &[u8]) -> Vec<EntryParams> {
-    let mut parser = Parser::new(Limits::default());
-    let mut results = Vec::new();
-    let mut offset = 0;
-
-    loop {
-        let input = &data[offset..];
-        match parser.parse(input).expect("parse should succeed") {
-            ParseEvent::NeedData { .. } => {
-                panic!("unexpected NeedData — archive should be complete in memory");
-            }
-            ParseEvent::Entry { consumed, entry } => {
-                offset += consumed;
-
-                let path = entry.path.to_vec();
-                let size = entry.size as usize;
-                let uname = entry.uname.as_ref().map(|u| u.to_vec()).unwrap_or_default();
-                let gname = entry.gname.as_ref().map(|g| g.to_vec()).unwrap_or_default();
-                let is_dir = entry.entry_type.is_dir();
-
-                // Read content
-                let content = data[offset..offset + size].to_vec();
-                let padded_size = size.next_multiple_of(HEADER_SIZE);
-                offset += padded_size;
-
-                results.push(EntryParams {
-                    path,
-                    mode: entry.mode,
-                    uid: entry.uid as u32,
-                    gid: entry.gid as u32,
-                    mtime: entry.mtime as u32,
-                    username: uname,
-                    groupname: gname,
-                    content,
-                    is_dir,
-                });
-            }
-            ParseEvent::SparseEntry { .. } => {
-                panic!("unexpected SparseEntry in interop test");
-            }
-            ParseEvent::GlobalExtensions { consumed, .. } => {
-                offset += consumed;
-            }
-            ParseEvent::End { .. } => break,
-        }
-    }
-
-    results
-}
-
 // =============================================================================
 // GNU tar interaction helpers
 // =============================================================================
@@ -471,7 +421,7 @@ fn test_gnu_tar_to_tar_core(sh: &Shell, entries: &[EntryParams], format: &str) {
 
     // Parse with tar-core
     let archive_data = std::fs::read(&archive_path).expect("read archive");
-    let parsed = parse_tar_core_archive(&archive_data);
+    let parsed: Vec<OwnedEntry> = parse_tar_core_with_limits(&archive_data, Limits::default());
 
     // Verify entries match.
     // GNU tar may reorder or add parent directories, so we compare by path.
@@ -705,7 +655,7 @@ fn smoke_test_gnu_tar_non_utf8_roundtrip(sh: &Shell) {
     );
 
     let archive_data = std::fs::read(&archive_path).expect("read archive");
-    let parsed = parse_tar_core_archive(&archive_data);
+    let parsed: Vec<OwnedEntry> = parse_tar_core_with_limits(&archive_data, Limits::default());
 
     let found = parsed
         .iter()
