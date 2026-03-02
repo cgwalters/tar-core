@@ -644,6 +644,12 @@ pub struct Parser {
     /// When true, entries with empty paths are allowed through instead of
     /// returning [`ParseError::EmptyPath`].
     allow_empty_path: bool,
+    /// When false, header checksum verification is skipped. This is useful
+    /// for fuzzing, where random input almost never has valid checksums,
+    /// preventing the fuzzer from exercising deeper parser logic.
+    ///
+    /// Default: `true`.
+    verify_checksums: bool,
 }
 
 impl Parser {
@@ -655,6 +661,7 @@ impl Parser {
             state: State::ReadHeader,
             pending: PendingMetadata::default(),
             allow_empty_path: false,
+            verify_checksums: true,
         }
     }
 
@@ -662,6 +669,19 @@ impl Parser {
     /// [`ParseError::EmptyPath`].
     pub fn set_allow_empty_path(&mut self, allow: bool) {
         self.allow_empty_path = allow;
+    }
+
+    /// Control whether header checksums are verified during parsing.
+    ///
+    /// When set to `false`, the parser skips [`Header::verify_checksum`]
+    /// calls, accepting headers regardless of their checksum field. This
+    /// is primarily useful for fuzz testing, where random input almost
+    /// never produces valid checksums, preventing the fuzzer from reaching
+    /// deeper parser code paths.
+    ///
+    /// Default: `true`.
+    pub fn set_verify_checksums(&mut self, verify: bool) {
+        self.verify_checksums = verify;
     }
 
     /// Create a new parser with default limits.
@@ -756,7 +776,9 @@ impl Parser {
 
         // Parse header
         let header = Header::from_bytes(header_bytes);
-        header.verify_checksum()?;
+        if self.verify_checksums {
+            header.verify_checksum()?;
+        }
 
         let entry_type = header.entry_type();
         let size = header.entry_size()?;
