@@ -12,11 +12,15 @@ use libfuzzer_sys::fuzz_target;
 use tar_core_testutil::{parse_tar_core, parse_tar_rs, OwnedEntry};
 
 /// Compare entries parsed by tar-rs and tar-core, asserting equivalence.
+///
+/// tar-core is intentionally more lenient than tar-rs in some cases (e.g.
+/// all-null numeric fields are accepted as 0), so we only require that
+/// tar-core parses *at least* as many entries as tar-rs and that those
+/// entries match.
 fn compare_entries(tar_rs_entries: &[OwnedEntry], tar_core_entries: &[OwnedEntry]) {
-    assert_eq!(
-        tar_core_entries.len(),
-        tar_rs_entries.len(),
-        "entry count mismatch: tar-core={} tar-rs={}",
+    assert!(
+        tar_core_entries.len() >= tar_rs_entries.len(),
+        "tar-core parsed fewer entries than tar-rs: tar-core={} tar-rs={}",
         tar_core_entries.len(),
         tar_rs_entries.len(),
     );

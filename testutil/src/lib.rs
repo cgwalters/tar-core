@@ -65,14 +65,19 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
                 offset += consumed;
 
                 let size = entry.size;
-                let read_size = size.min(MAX_CONTENT_READ) as usize;
 
-                let content_end = offset.saturating_add(read_size);
-                let (content, truncated) = if content_end <= data.len() {
-                    (data[offset..content_end].to_vec(), false)
-                } else {
-                    (data[offset..].to_vec(), true)
-                };
+                // Require the full padded content to be present, matching
+                // tar-rs which errors (and stops iteration) on truncated
+                // content.  Without this, tar-core would happily return
+                // the entry from the header alone while tar-rs returns
+                // nothing, causing spurious differential mismatches.
+                let padded = (size as usize).next_multiple_of(HEADER_SIZE);
+                if offset.saturating_add(padded) > data.len() {
+                    break;
+                }
+
+                let read_size = size.min(MAX_CONTENT_READ) as usize;
+                let content = data[offset..offset + read_size].to_vec();
 
                 let xattrs: Vec<(Vec<u8>, Vec<u8>)> = entry
                     .xattrs
@@ -97,15 +102,6 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
                     content,
                 });
 
-                if truncated {
-                    break;
-                }
-
-                // Advance past content + padding.
-                let padded = (size as usize).next_multiple_of(HEADER_SIZE);
-                if offset.saturating_add(padded) > data.len() {
-                    break;
-                }
                 offset += padded;
             }
             Ok(ParseEvent::GlobalExtensions { consumed, .. }) => {
