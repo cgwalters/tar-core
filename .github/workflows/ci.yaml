@@ -18,15 +18,16 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
-  semver-checks:
-    name: Semver Checks
-    runs-on: ubuntu-24.04
-    steps:
-    - uses: actions/checkout@v6
-    - uses: obi1kenobi/cargo-semver-checks-action@v2
-      with:
-        # Pinned until cargo-semver-checks supports rustdoc format v57 (Rust 1.93+)
-        rust-toolchain: "1.92.0"
+  # Disabled until the crate is published to crates.io for the first time.
+  # cargo-semver-checks needs a baseline version to compare against.
+  # Re-enable after initial `cargo publish`.
+  #
+  # semver-checks:
+  #   name: Semver Checks
+  #   runs-on: ubuntu-24.04
+  #   steps:
+  #   - uses: actions/checkout@v6
+  #   - uses: obi1kenobi/cargo-semver-checks-action@v2
 
   build-test:
     name: Build+Test
@@ -57,13 +58,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install MSRV toolchain
+      - name: Determine MSRV from Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "::error::rust-version not found in Cargo.toml"
+            exit 1
+          fi
+          echo "version=$msrv" >> "$GITHUB_OUTPUT"
+      - name: Install MSRV toolchain (${{ steps.msrv.outputs.version }})
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.86.0"
+          toolchain: ${{ steps.msrv.outputs.version }}
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
+      # Only build the library itself at MSRV — dev-dependencies may
+      # legitimately require a newer Rust version.
       - name: Build (MSRV)
-        run: cargo build
-      - name: Test (MSRV)
-        run: cargo test
+        run: cargo build --lib
+      - name: Check (no-std, MSRV)
+        run: cargo check --lib --no-default-features
