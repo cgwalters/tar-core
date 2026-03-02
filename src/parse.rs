@@ -815,7 +815,9 @@ impl Parser {
                     });
                 }
 
-                let total_size = HEADER_SIZE as u64 + padded_size;
+                let total_size = (HEADER_SIZE as u64)
+                    .checked_add(padded_size)
+                    .ok_or(ParseError::InvalidSize(size))?;
                 if (input.len() as u64) < total_size {
                     return Ok(ParseEvent::NeedData {
                         min_bytes: total_size as usize,
@@ -898,7 +900,9 @@ impl Parser {
             });
         }
 
-        let total_size = HEADER_SIZE as u64 + padded_size;
+        let total_size = (HEADER_SIZE as u64)
+            .checked_add(padded_size)
+            .ok_or(ParseError::InvalidSize(size))?;
         if (input.len() as u64) < total_size {
             return Ok(ParseEvent::NeedData {
                 min_bytes: total_size as usize,
