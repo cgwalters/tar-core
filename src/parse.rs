@@ -1558,6 +1558,13 @@ impl Parser {
         // Clear pending metadata
         self.pending.clear();
 
+        // Normalize: empty link target is semantically equivalent to no link
+        // target.  PAX `linkpath` and GNU long link can set an empty value that
+        // would otherwise surface as `Some([])` instead of `None`.
+        if link_target.as_ref().is_some_and(|v| v.is_empty()) {
+            link_target = None;
+        }
+
         // Reject entries with empty paths
         if path.is_empty() && !self.allow_empty_path {
             return Err(ParseError::EmptyPath);
