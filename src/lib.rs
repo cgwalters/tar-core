@@ -1444,6 +1444,18 @@ impl OctU64 {
     }
 }
 
+/// Test whether a byte is whitespace in the context of tar header fields.
+///
+/// This includes all bytes that `u8::is_ascii_whitespace()` recognizes
+/// (HT, LF, FF, CR, space) **plus** vertical tab (0x0b). Rust's
+/// `is_ascii_whitespace` follows the WHATWG definition which omits VT,
+/// but real tar implementations (and Rust's `str::trim()`) treat it as
+/// whitespace. Without this, fields like `"0000000\x0b"` would fail to
+/// parse.
+fn is_tar_whitespace(b: u8) -> bool {
+    b.is_ascii_whitespace() || b == 0x0b
+}
+
 /// Parse an octal ASCII field into a u64.
 ///
 /// Octal fields in tar headers are ASCII strings with optional leading
@@ -1458,20 +1470,24 @@ impl OctU64 {
 pub(crate) fn parse_octal(bytes: &[u8]) -> Result<u64> {
     // Tar octal fields are padded with leading spaces/nulls and terminated
     // by spaces, tabs, or null bytes. We first truncate at the first null
-    // (matching how C-string fields work in tar), then trim ASCII
-    // whitespace from both ends to isolate the digit run.
+    // (matching how C-string fields work in tar), then trim whitespace from
+    // both ends to isolate the digit run.
+    //
+    // Note: we use `is_tar_whitespace` rather than `u8::is_ascii_whitespace`
+    // because the latter omits vertical tab (0x0b), which real tar
+    // implementations treat as whitespace (and Rust's `str::trim()` strips).
     let truncated = match bytes.iter().position(|&b| b == 0) {
         Some(i) => &bytes[..i],
         None => bytes,
     };
     let trimmed = truncated
         .iter()
-        .position(|&b| !b.is_ascii_whitespace())
+        .position(|&b| !is_tar_whitespace(b))
         .map(|start| {
             let rest = &truncated[start..];
             let end = rest
                 .iter()
-                .rposition(|&b| !b.is_ascii_whitespace())
+                .rposition(|&b| !is_tar_whitespace(b))
                 .map_or(0, |p| p + 1);
             &rest[..end]
         })

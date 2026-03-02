@@ -786,18 +786,23 @@ impl Parser {
             .checked_next_multiple_of(HEADER_SIZE as u64)
             .ok_or(ParseError::InvalidSize(size))?;
 
-        // Handle metadata entry types
+        // Metadata entry types (GNU long name/link, PAX headers, GNU sparse)
+        // only make sense in archives that actually use those formats. A V7-
+        // style header whose type flag byte happens to be 'L' or 'x' should
+        // be treated as a regular entry, not as a metadata extension. This
+        // matches tar-rs's `is_recognized_header` guard.
+        let is_extension_format = header.is_gnu() || header.is_ustar();
         match entry_type {
-            EntryType::GnuLongName => {
+            EntryType::GnuLongName if is_extension_format => {
                 self.handle_extension(input, size, padded_size, ExtensionKind::GnuLongName)
             }
-            EntryType::GnuLongLink => {
+            EntryType::GnuLongLink if is_extension_format => {
                 self.handle_extension(input, size, padded_size, ExtensionKind::GnuLongLink)
             }
-            EntryType::XHeader => {
+            EntryType::XHeader if is_extension_format => {
                 self.handle_extension(input, size, padded_size, ExtensionKind::Pax)
             }
-            EntryType::XGlobalHeader => {
+            EntryType::XGlobalHeader if is_extension_format => {
                 // Check size limit (same as local PAX headers)
                 if size > self.limits.max_pax_size {
                     return Err(ParseError::PaxTooLarge {
@@ -822,7 +827,9 @@ impl Parser {
                     pax_data,
                 })
             }
-            EntryType::GnuSparse => self.handle_gnu_sparse(input, header, size),
+            EntryType::GnuSparse if is_extension_format => {
+                self.handle_gnu_sparse(input, header, size)
+            }
             _ => {
                 // Check for PAX v1.0 sparse before emitting — it requires
                 // reading the sparse map from the data stream.
