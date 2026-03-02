@@ -14,8 +14,9 @@ use tar_core::HEADER_SIZE;
 
 /// Drive a parser to completion over `data`, checking invariants on each entry.
 /// Returns normally on errors or NeedData — the point is that it must not panic.
-fn run_parser(data: &[u8], limits: Limits) {
+fn run_parser(data: &[u8], limits: Limits, verify_checksums: bool) {
     let mut parser = Parser::new(limits);
+    parser.set_verify_checksums(verify_checksums);
     let mut offset: usize = 0;
 
     loop {
@@ -99,8 +100,14 @@ fn run_parser(data: &[u8], limits: Limits) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Run with permissive limits (should accept anything that isn't structurally broken).
-    run_parser(data, Limits::permissive());
-    // Run with default limits (stricter — may error on oversized paths/pax, but must not panic).
-    run_parser(data, Limits::default());
+    // 90% of the time, skip checksum verification to exercise deeper parser
+    // logic (PAX extensions, GNU long name/link, sparse files, field parsing,
+    // etc.). Random fuzz input almost never has valid checksums, so without
+    // this the fuzzer would break immediately on every input.
+    //
+    // 10% of the time, verify checksums normally to test that code path too.
+    let skip_checksums = !data.is_empty() && data[0] % 10 != 0;
+
+    run_parser(data, Limits::permissive(), !skip_checksums);
+    run_parser(data, Limits::default(), !skip_checksums);
 });
