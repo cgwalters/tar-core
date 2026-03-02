@@ -48,6 +48,9 @@ pub fn parse_tar_core(data: &[u8]) -> Vec<OwnedEntry> {
 pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry> {
     let mut results = Vec::new();
     let mut parser = Parser::new(limits);
+    // Allow entries with empty paths so we don't stop parsing early.
+    // We skip them below to match parse_tar_rs's behaviour.
+    parser.set_allow_empty_path(true);
     let mut offset = 0;
 
     loop {
@@ -80,6 +83,36 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
                     .iter()
                     .map(|(k, v)| (k.to_vec(), v.to_vec()))
                     .collect();
+
+                // Skip metadata-only entry types to match parse_tar_rs.
+                // When a header lacks valid magic, tar-core (and tar-rs)
+                // emit extension types (L/K/x/g) as regular entries.
+                // parse_tar_rs skips these, so we must too.
+                let is_metadata_type = matches!(
+                    entry.entry_type,
+                    tar_core::EntryType::GnuLongName
+                        | tar_core::EntryType::GnuLongLink
+                        | tar_core::EntryType::XHeader
+                        | tar_core::EntryType::XGlobalHeader
+                );
+                if is_metadata_type {
+                    let padded = (size as usize).next_multiple_of(HEADER_SIZE);
+                    if offset.saturating_add(padded) > data.len() {
+                        break;
+                    }
+                    offset += padded;
+                    continue;
+                }
+
+                // Skip entries with empty paths to match parse_tar_rs.
+                if entry.path.is_empty() {
+                    let padded = (size as usize).next_multiple_of(HEADER_SIZE);
+                    if offset.saturating_add(padded) > data.len() {
+                        break;
+                    }
+                    offset += padded;
+                    continue;
+                }
 
                 results.push(OwnedEntry {
                     entry_type: entry.entry_type.to_byte(),
