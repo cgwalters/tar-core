@@ -6,7 +6,7 @@
 
 use std::io::{Cursor, Read};
 
-use tar_core::parse::{Limits, ParseEvent, Parser};
+use tar_core::parse::{Limits, ParseError, ParseEvent, Parser};
 use tar_core::{HEADER_SIZE, PAX_SCHILY_XATTR};
 
 /// Owned snapshot of a parsed tar entry, including content bytes.
@@ -39,19 +39,34 @@ pub struct OwnedEntry {
 /// Maximum content size read per entry (prevents OOM on fuzzed inputs).
 const MAX_CONTENT_READ: u64 = 256 * 1024;
 
+/// Result of parsing with tar-core: entries collected so far plus an
+/// optional terminal error (if parsing stopped due to an error rather
+/// than reaching end-of-archive or running out of data).
+pub struct TarCoreParseResult {
+    pub entries: Vec<OwnedEntry>,
+    pub error: Option<ParseError>,
+}
+
 /// Parse a tar archive with tar-core's sans-IO parser using permissive limits.
 pub fn parse_tar_core(data: &[u8]) -> Vec<OwnedEntry> {
-    parse_tar_core_with_limits(data, Limits::permissive())
+    parse_tar_core_detailed(data, Limits::permissive()).entries
 }
 
 /// Parse a tar archive with tar-core using the given limits.
 pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry> {
+    parse_tar_core_detailed(data, limits).entries
+}
+
+/// Parse a tar archive with tar-core, returning both entries and
+/// any terminal parse error.
+pub fn parse_tar_core_detailed(data: &[u8], limits: Limits) -> TarCoreParseResult {
     let mut results = Vec::new();
     let mut parser = Parser::new(limits);
     // Allow entries with empty paths so we don't stop parsing early.
     // We skip them below to match parse_tar_rs's behaviour.
     parser.set_allow_empty_path(true);
     let mut offset = 0;
+    let mut terminal_error = None;
 
     loop {
         if offset > data.len() {
@@ -143,11 +158,17 @@ pub fn parse_tar_core_with_limits(data: &[u8], limits: Limits) -> Vec<OwnedEntry
                 offset += consumed;
             }
             Ok(ParseEvent::End { .. }) => break,
-            Err(_) => break,
+            Err(e) => {
+                terminal_error = Some(e);
+                break;
+            }
         }
     }
 
-    results
+    TarCoreParseResult {
+        entries: results,
+        error: terminal_error,
+    }
 }
 
 /// Parse a tar archive with the `tar` crate, returning owned entries.
