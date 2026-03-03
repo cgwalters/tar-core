@@ -5,39 +5,69 @@
 //! - Padded size is always >= size and block-aligned (or both zero).
 //! - Parsed entry paths are never empty.
 //! - Total consumed bytes never exceed the input length.
+//!
+//! The parser is exercised with variable-length short reads to stress the
+//! NeedData/retry path that real callers hit with partial I/O. Each parse
+//! call gets a different chunk size from a seeded RNG, simulating realistic
+//! non-uniform read patterns.
 
 #![no_main]
 
+use std::mem::size_of;
+
 use libfuzzer_sys::fuzz_target;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use tar_core::parse::{Limits, ParseEvent, Parser};
 use tar_core::HEADER_SIZE;
 
-/// Drive a parser to completion over `data`, checking invariants on each entry.
-/// Returns normally on errors or NeedData — the point is that it must not panic.
-fn run_parser(data: &[u8], limits: Limits, verify_checksums: bool) {
+/// Max chunk size ceiling for short-read simulation (1 MiB).
+const MAX_CHUNK_CEILING: u32 = 1024 * 1024;
+
+/// Drive a parser to completion over `data`, feeding it variable-sized
+/// chunks drawn from `rng` to simulate realistic partial reads.
+///
+/// On NeedData, the exposed window grows to provide the requested minimum.
+/// After each successfully processed event, a fresh chunk size is drawn
+/// from the RNG so the parser sees different split points throughout.
+///
+/// Checks invariants on each entry and returns normally on errors or
+/// NeedData — the point is that it must not panic.
+fn run_parser(data: &[u8], limits: Limits, verify_checksums: bool, rng: &mut SmallRng) {
     let mut parser = Parser::new(limits);
     parser.set_verify_checksums(verify_checksums);
     let mut offset: usize = 0;
+    let mut window = rng.random_range(1..=MAX_CHUNK_CEILING) as usize;
 
     loop {
         assert!(offset <= data.len(), "offset exceeded input length");
-        let input = &data[offset..];
+        let remaining = data.len() - offset;
+        if remaining == 0 {
+            break;
+        }
+
+        let input = &data[offset..offset + remaining.min(window)];
 
         match parser.parse(input) {
-            Ok(ParseEvent::NeedData { .. }) => break,
+            Ok(ParseEvent::NeedData { min_bytes }) => {
+                if remaining < min_bytes {
+                    break;
+                }
+                // Widen the window to satisfy the parser's request and retry.
+                window = min_bytes;
+                continue;
+            }
 
             Ok(ParseEvent::Entry { consumed, entry })
             | Ok(ParseEvent::SparseEntry {
                 consumed, entry, ..
             }) => {
-                // consumed bytes must not exceed remaining input
                 assert!(
                     consumed <= input.len(),
-                    "consumed {consumed} > remaining {}",
+                    "consumed {consumed} > input len {}",
                     input.len()
                 );
 
-                // Padded-size invariants
                 assert!(
                     entry.padded_size() >= entry.size,
                     "padded_size {} < size {}",
@@ -55,39 +85,39 @@ fn run_parser(data: &[u8], limits: Limits, verify_checksums: bool) {
                     );
                 }
 
-                // Path must not be empty
                 assert!(!entry.path.is_empty(), "entry path is empty");
 
                 offset += consumed;
 
-                // Skip content + padding; if not enough data remains, bail out.
                 let padded = entry.padded_size() as usize;
                 if offset.saturating_add(padded) > data.len() {
                     break;
                 }
                 offset += padded;
+
+                window = rng.random_range(1..=MAX_CHUNK_CEILING) as usize;
             }
 
             Ok(ParseEvent::GlobalExtensions { consumed, .. }) => {
                 assert!(
                     consumed <= input.len(),
-                    "GlobalExtensions consumed {consumed} > remaining {}",
+                    "GlobalExtensions consumed {consumed} > input len {}",
                     input.len()
                 );
                 offset += consumed;
+                window = rng.random_range(1..=MAX_CHUNK_CEILING) as usize;
             }
 
             Ok(ParseEvent::End { consumed }) => {
                 assert!(
                     consumed <= input.len(),
-                    "End consumed {consumed} > remaining {}",
+                    "End consumed {consumed} > input len {}",
                     input.len()
                 );
                 offset += consumed;
                 break;
             }
 
-            // Parse errors are expected on fuzzed input — just stop.
             Err(_) => break,
         }
     }
@@ -99,15 +129,24 @@ fn run_parser(data: &[u8], limits: Limits, verify_checksums: bool) {
     );
 }
 
-fuzz_target!(|data: &[u8]| {
-    // 90% of the time, skip checksum verification to exercise deeper parser
-    // logic (PAX extensions, GNU long name/link, sparse files, field parsing,
-    // etc.). Random fuzz input almost never has valid checksums, so without
-    // this the fuzzer would break immediately on every input.
-    //
-    // 10% of the time, verify checksums normally to test that code path too.
-    let skip_checksums = !data.is_empty() && data[0] % 10 != 0;
+/// Byte offset where the tar payload begins (after the config/seed header).
+const PAYLOAD_OFFSET: usize = 1 + size_of::<u64>();
 
-    run_parser(data, Limits::permissive(), !skip_checksums);
-    run_parser(data, Limits::default(), !skip_checksums);
+fuzz_target!(|data: &[u8]| {
+    if data.len() < PAYLOAD_OFFSET {
+        return;
+    }
+
+    // First byte: checksum behavior.
+    // 90% skip checksums, 10% verify them.
+    let skip_checksums = data[0] % 10 != 0;
+
+    // Bytes 1..9: seed for the chunk-size RNG.
+    let seed = u64::from_le_bytes(data[1..PAYLOAD_OFFSET].try_into().unwrap());
+    let mut rng = SmallRng::seed_from_u64(seed);
+
+    let payload = &data[PAYLOAD_OFFSET..];
+
+    run_parser(payload, Limits::permissive(), !skip_checksums, &mut rng);
+    run_parser(payload, Limits::default(), !skip_checksums, &mut rng);
 });

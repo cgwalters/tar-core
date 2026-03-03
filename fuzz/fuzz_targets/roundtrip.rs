@@ -2,12 +2,15 @@
 //! verify roundtrip equivalence.
 //!
 //! The invariant: if EntryBuilder successfully produces an archive, Parser
-//! must parse it back to identical metadata and content.
+//! must parse it back to identical metadata and content — even when the
+//! parser only receives variable-length short reads from a seeded RNG.
 
 #![no_main]
 
 use arbitrary::{Arbitrary, Unstructured};
 use libfuzzer_sys::fuzz_target;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use tar_core::builder::EntryBuilder;
 use tar_core::parse::{Limits, ParseEvent, Parser};
 use tar_core::{EntryType, SparseEntry, HEADER_SIZE};
@@ -30,6 +33,8 @@ struct FuzzEntry {
     sparse_entries: Vec<(u16, u16)>,
     /// When true and entry_kind selects Regular, build a sparse entry
     use_sparse: bool,
+    /// Seed for the short-read chunk size RNG.
+    rng_seed: u64,
 }
 
 /// Strip NUL bytes, ensure non-empty, clamp length.
@@ -192,17 +197,12 @@ fuzz_target!(|data: &[u8]| {
     // End-of-archive marker
     archive.extend(std::iter::repeat_n(0u8, HEADER_SIZE * 2));
 
-    // Parse it back
+    // Parse it back with variable-length short reads to exercise NeedData.
+    let mut rng = SmallRng::seed_from_u64(entry.rng_seed);
     let mut parser = Parser::new(Limits::default());
     let mut offset = 0;
 
-    let input = &archive[offset..];
-    let event = match parser.parse(input) {
-        Ok(e) => e,
-        other => {
-            panic!("expected successful parse from archive we just built, got: {other:?}");
-        }
-    };
+    let event = parse_short_read(&mut parser, &archive, &mut offset, &mut rng);
 
     // Extract parsed entry and verify sparse-specific fields
     let parsed_entry = match event {
@@ -294,10 +294,48 @@ fuzz_target!(|data: &[u8]| {
     let padded = content.len().next_multiple_of(HEADER_SIZE);
     offset += padded;
 
-    match parser.parse(&archive[offset..]) {
-        Ok(ParseEvent::End { .. }) => {}
+    let end_event = parse_short_read(&mut parser, &archive, &mut offset, &mut rng);
+    match end_event {
+        ParseEvent::End { .. } => {}
         other => {
             panic!("expected End after single entry, got: {other:?}");
         }
     }
 });
+
+/// Max chunk size ceiling for short-read simulation (1 MiB).
+const MAX_CHUNK_CEILING: u32 = 1024 * 1024;
+
+/// Parse the next event from `archive[*offset..]` using variable-length
+/// short reads drawn from `rng`, growing the window when the parser
+/// requests more via NeedData.
+///
+/// Panics if parsing fails or if the archive is truncated (since we
+/// built it ourselves, it must always be complete).
+fn parse_short_read<'a>(
+    parser: &mut Parser,
+    archive: &'a [u8],
+    offset: &mut usize,
+    rng: &mut SmallRng,
+) -> ParseEvent<'a> {
+    let mut window = rng.random_range(1..=MAX_CHUNK_CEILING) as usize;
+    loop {
+        let remaining = archive.len() - *offset;
+        assert!(remaining > 0, "unexpected end of archive we just built");
+        let input = &archive[*offset..*offset + remaining.min(window)];
+        match parser.parse(input) {
+            Ok(ParseEvent::NeedData { min_bytes }) => {
+                assert!(
+                    remaining >= min_bytes,
+                    "archive we built is truncated: need {min_bytes}, have {remaining}"
+                );
+                window = min_bytes;
+                continue;
+            }
+            Ok(event) => return event,
+            Err(e) => {
+                panic!("expected successful parse from archive we just built, got error: {e}");
+            }
+        }
+    }
+}
