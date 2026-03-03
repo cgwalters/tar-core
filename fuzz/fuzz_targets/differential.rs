@@ -5,11 +5,23 @@
 //! tar-core must never panic. A secondary goal is that whenever tar-rs
 //! successfully parses an entry, tar-core should produce a matching entry
 //! with equivalent metadata, xattrs, and identical content bytes.
+//!
+//! ## Behavioral difference allowlist
+//!
+//! tar-core is intentionally stricter than tar-rs in some areas. When
+//! tar-core rejects an archive that tar-rs accepts, we check whether the
+//! error falls into a known category of expected divergence before
+//! failing the test. Current allowlisted differences:
+//!
+//! - **Malformed PAX records**: tar-core propagates PAX parse errors
+//!   (malformed record format, non-UTF-8 keys). tar-rs silently skips
+//!   malformed PAX records via `.flatten()`.
 
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tar_core_testutil::{parse_tar_core, parse_tar_rs, OwnedEntry};
+use tar_core::parse::{Limits, ParseError};
+use tar_core_testutil::{parse_tar_core_detailed, parse_tar_rs, OwnedEntry};
 
 /// Dump the raw 512-byte headers from the (post-fixup) data to stderr.
 fn dump_headers(data: &[u8]) {
@@ -30,33 +42,68 @@ fn dump_headers(data: &[u8]) {
     }
 }
 
+/// Returns true if the error is a known behavioral difference where
+/// tar-core is intentionally stricter than tar-rs.
+///
+/// When this returns true, tar-rs may have parsed more entries than
+/// tar-core, and that's expected.
+fn is_allowlisted_divergence(err: &ParseError) -> bool {
+    matches!(
+        err,
+        // tar-core rejects malformed PAX records; tar-rs silently skips them.
+        ParseError::Pax(_) | ParseError::InvalidUtf8(_)
+    )
+}
+
 /// Compare entries parsed by tar-rs and tar-core, asserting equivalence.
 ///
 /// tar-core is intentionally more lenient than tar-rs in some cases (e.g.
 /// all-null numeric fields are accepted as 0), so we only require that
 /// tar-core parses *at least* as many entries as tar-rs and that those
 /// entries match.
-fn compare_entries(data: &[u8], tar_rs_entries: &[OwnedEntry], tar_core_entries: &[OwnedEntry]) {
-    if tar_core_entries.len() < tar_rs_entries.len() {
-        eprintln!(
-            "entry count mismatch: tar-core={} tar-rs={}",
-            tar_core_entries.len(),
-            tar_rs_entries.len()
-        );
-        dump_headers(data);
-        for (i, e) in tar_rs_entries.iter().enumerate() {
-            eprintln!("tar-rs  [{i}]: {e:?}");
+fn compare_entries(
+    data: &[u8],
+    tar_rs_entries: &[OwnedEntry],
+    tar_core_entries: &[OwnedEntry],
+    tar_core_error: Option<&ParseError>,
+) {
+    let count_mismatch = tar_core_entries.len() < tar_rs_entries.len();
+
+    if count_mismatch {
+        // Check the behavioral difference allowlist: if tar-core stopped
+        // due to a known stricter-than-tar-rs error, the entry count
+        // divergence is expected. We still verify the entries that *were*
+        // parsed match (fall through to the zip comparison below).
+        let allowlisted = tar_core_error.is_some_and(|err| is_allowlisted_divergence(err));
+
+        if !allowlisted {
+            eprintln!(
+                "entry count mismatch: tar-core={} tar-rs={}",
+                tar_core_entries.len(),
+                tar_rs_entries.len()
+            );
+            if let Some(err) = tar_core_error {
+                eprintln!("tar-core error: {err}");
+            }
+            dump_headers(data);
+            for (i, e) in tar_rs_entries.iter().enumerate() {
+                eprintln!("tar-rs  [{i}]: {e:?}");
+            }
+            for (i, e) in tar_core_entries.iter().enumerate() {
+                eprintln!("tar-core[{i}]: {e:?}");
+            }
+            panic!(
+                "tar-core parsed fewer entries than tar-rs: tar-core={} tar-rs={}",
+                tar_core_entries.len(),
+                tar_rs_entries.len(),
+            );
         }
-        for (i, e) in tar_core_entries.iter().enumerate() {
-            eprintln!("tar-core[{i}]: {e:?}");
-        }
-        panic!(
-            "tar-core parsed fewer entries than tar-rs: tar-core={} tar-rs={}",
-            tar_core_entries.len(),
-            tar_rs_entries.len(),
-        );
     }
 
+    // Compare entries that both parsers produced. When there's an
+    // allowlisted count mismatch, zip stops at the shorter list,
+    // verifying that tar-core's entries are correct up to the point
+    // where it diverged.
     for (i, (rs, core)) in tar_rs_entries.iter().zip(tar_core_entries).enumerate() {
         if rs != core {
             eprintln!("mismatch at entry {i}:");
@@ -130,6 +177,17 @@ fn parse_octal_simple(bytes: &[u8]) -> Option<u64> {
     u64::from_str_radix(s, 8).ok()
 }
 
+fn run_differential(data: &[u8]) {
+    let tar_rs_entries = parse_tar_rs(data);
+    let result = parse_tar_core_detailed(data, Limits::permissive());
+    compare_entries(
+        data,
+        &tar_rs_entries,
+        &result.entries,
+        result.error.as_ref(),
+    );
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.len() > 256 * 1024 {
         return;
@@ -142,12 +200,8 @@ fuzz_target!(|data: &[u8]| {
     if should_fixup {
         let mut data = data.to_vec();
         fixup_checksums(&mut data);
-        let tar_rs_entries = parse_tar_rs(&data);
-        let tar_core_entries = parse_tar_core(&data);
-        compare_entries(&data, &tar_rs_entries, &tar_core_entries);
+        run_differential(&data);
     } else {
-        let tar_rs_entries = parse_tar_rs(data);
-        let tar_core_entries = parse_tar_core(data);
-        compare_entries(data, &tar_rs_entries, &tar_core_entries);
+        run_differential(data);
     }
 });
