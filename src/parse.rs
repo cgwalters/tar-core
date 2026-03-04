@@ -46,6 +46,7 @@
 //! ```
 
 use alloc::borrow::Cow;
+use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -286,7 +287,7 @@ pub enum ParseError {
 
     /// A PAX sparse map field is malformed.
     #[error("invalid PAX sparse map: {0}")]
-    InvalidPaxSparseMap(String),
+    InvalidPaxSparseMap(Cow<'static, str>),
 
     /// A PAX extension value failed to parse in strict mode.
     #[error("invalid PAX {key} value: {value:?}")]
@@ -294,7 +295,7 @@ pub enum ParseError {
         /// The PAX key (e.g. "uid", "size").
         key: &'static str,
         /// The raw value string.
-        value: String,
+        value: Cow<'static, str>,
     },
 
     /// Entry path is empty after applying all overrides (GNU long name, PAX path, etc.).
@@ -619,7 +620,7 @@ fn pax_sparse_version(pax: &[u8], strict: bool) -> Result<Option<(u64, u64)>> {
                     Err(_) => {
                         return Err(ParseError::InvalidPaxValue {
                             key: PAX_GNU_SPARSE_MAJOR,
-                            value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                            value: Cow::Borrowed("<non-UTF-8>"),
                         })
                     }
                 };
@@ -629,7 +630,7 @@ fn pax_sparse_version(pax: &[u8], strict: bool) -> Result<Option<(u64, u64)>> {
                     Err(_) => {
                         return Err(ParseError::InvalidPaxValue {
                             key: PAX_GNU_SPARSE_MAJOR,
-                            value: s.into(),
+                            value: s.to_owned().into(),
                         })
                     }
                 }
@@ -641,7 +642,7 @@ fn pax_sparse_version(pax: &[u8], strict: bool) -> Result<Option<(u64, u64)>> {
                     Err(_) => {
                         return Err(ParseError::InvalidPaxValue {
                             key: PAX_GNU_SPARSE_MINOR,
-                            value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                            value: Cow::Borrowed("<non-UTF-8>"),
                         })
                     }
                 };
@@ -651,7 +652,7 @@ fn pax_sparse_version(pax: &[u8], strict: bool) -> Result<Option<(u64, u64)>> {
                     Err(_) => {
                         return Err(ParseError::InvalidPaxValue {
                             key: PAX_GNU_SPARSE_MINOR,
-                            value: s.into(),
+                            value: s.to_owned().into(),
                         })
                     }
                 }
@@ -1047,7 +1048,9 @@ impl Parser {
         // Extract sparse metadata from PAX extensions.
         let pax = slices
             .pax_extensions
-            .ok_or_else(|| ParseError::InvalidPaxSparseMap("missing PAX extensions".into()))?;
+            .ok_or(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                "missing PAX extensions",
+            )))?;
 
         let strict = self.limits.strict;
         let mut real_size = None;
@@ -1067,7 +1070,7 @@ impl Parser {
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key: PAX_GNU_SPARSE_REALSIZE,
-                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                                value: Cow::Borrowed("<non-UTF-8>"),
                             })
                         }
                     };
@@ -1077,7 +1080,7 @@ impl Parser {
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key: PAX_GNU_SPARSE_REALSIZE,
-                                value: s.into(),
+                                value: s.to_owned().into(),
                             })
                         }
                     }
@@ -1089,8 +1092,9 @@ impl Parser {
             }
         }
 
-        let real_size = real_size
-            .ok_or_else(|| ParseError::InvalidPaxSparseMap("missing GNU.sparse.realsize".into()))?;
+        let real_size = real_size.ok_or(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+            "missing GNU.sparse.realsize",
+        )))?;
 
         // The sparse map data starts right after the header (at offset
         // HEADER_SIZE within the input). We need to parse it without
@@ -1113,16 +1117,16 @@ impl Parser {
             let s = match core::str::from_utf8(line) {
                 Ok(s) => s,
                 Err(_) => {
-                    return Some(Err(ParseError::InvalidPaxSparseMap(
-                        "non-UTF8 in sparse map".into(),
-                    )))
+                    return Some(Err(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                        "non-UTF8 in sparse map",
+                    ))))
                 }
             };
             match s.parse::<u64>() {
                 Ok(v) => Some(Ok(v)),
-                Err(_) => Some(Err(ParseError::InvalidPaxSparseMap(format!(
-                    "invalid decimal: {s:?}"
-                )))),
+                Err(_) => Some(Err(ParseError::InvalidPaxSparseMap(
+                    format!("invalid decimal: {s:?}").into(),
+                ))),
             }
         };
 
@@ -1180,9 +1184,11 @@ impl Parser {
 
         // The remaining content size is the original size minus the
         // sparse map prefix (including padding).
-        let content_size = size.checked_sub(map_size as u64).ok_or_else(|| {
-            ParseError::InvalidPaxSparseMap("sparse map prefix larger than entry size".into())
-        })?;
+        let content_size =
+            size.checked_sub(map_size as u64)
+                .ok_or(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                    "sparse map prefix larger than entry size",
+                )))?;
 
         let sparse_ctx = SparseContext {
             sparse_map,
@@ -1365,7 +1371,7 @@ impl Parser {
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key,
-                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                                value: Cow::Borrowed("<non-UTF-8>"),
                             })
                         }
                     };
@@ -1374,7 +1380,7 @@ impl Parser {
                         Err(_) if !strict => Ok(None),
                         Err(_) => Err(ParseError::InvalidPaxValue {
                             key,
-                            value: s.into(),
+                            value: s.to_owned().into(),
                         }),
                     }
                 };
@@ -1427,7 +1433,7 @@ impl Parser {
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxValue {
                                     key: PAX_MTIME,
-                                    value: String::from_utf8_lossy(value).into(),
+                                    value: Cow::Borrowed("<non-UTF-8>"),
                                 })
                             }
                         };
@@ -1438,7 +1444,7 @@ impl Parser {
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxValue {
                                     key: PAX_MTIME,
-                                    value: s.into(),
+                                    value: s.to_owned().into(),
                                 })
                             }
                         }
@@ -1477,17 +1483,17 @@ impl Parser {
                             Ok(s) => s,
                             Err(_) if !strict => continue,
                             Err(_) => {
-                                return Err(ParseError::InvalidPaxSparseMap(
-                                    "non-UTF8 sparse map".into(),
-                                ))
+                                return Err(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                                    "non-UTF8 sparse map",
+                                )))
                             }
                         };
                         let mut map = Vec::new();
                         let parts: Vec<&str> = s.split(',').filter(|p| !p.is_empty()).collect();
                         if parts.len() % 2 != 0 {
-                            return Err(ParseError::InvalidPaxSparseMap(
-                                "odd number of values in GNU.sparse.map".into(),
-                            ));
+                            return Err(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                                "odd number of values in GNU.sparse.map",
+                            )));
                         }
                         for pair in parts.chunks(2) {
                             if map.len() >= self.limits.max_sparse_entries {
@@ -1497,16 +1503,14 @@ impl Parser {
                                 });
                             }
                             let offset = pair[0].parse::<u64>().map_err(|_| {
-                                ParseError::InvalidPaxSparseMap(format!(
-                                    "invalid offset: {:?}",
-                                    pair[0]
-                                ))
+                                ParseError::InvalidPaxSparseMap(
+                                    format!("invalid offset: {:?}", pair[0]).into(),
+                                )
                             })?;
                             let length = pair[1].parse::<u64>().map_err(|_| {
-                                ParseError::InvalidPaxSparseMap(format!(
-                                    "invalid length: {:?}",
-                                    pair[1]
-                                ))
+                                ParseError::InvalidPaxSparseMap(
+                                    format!("invalid length: {:?}", pair[1]).into(),
+                                )
                             })?;
                             map.push(SparseEntry { offset, length });
                         }
