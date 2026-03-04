@@ -81,7 +81,7 @@ use crate::{
 /// let limits = Limits::default();
 ///
 /// // Customize limits
-/// let strict_limits = Limits {
+/// let limits = Limits {
 ///     max_metadata_size: 64 * 1024,
 ///     // Set to libc::PATH_MAX when extracting to disk
 ///     max_path_len: Some(4096),
@@ -133,13 +133,6 @@ pub struct Limits {
     ///
     /// Default: 10000.
     pub max_sparse_entries: usize,
-
-    /// When true, PAX extension values that fail to parse (invalid UTF-8,
-    /// invalid integer for numeric fields like `uid`, `gid`, `size`, `mtime`)
-    /// cause errors instead of being silently ignored.
-    ///
-    /// Default: `true`.
-    pub strict: bool,
 }
 
 impl Default for Limits {
@@ -149,7 +142,6 @@ impl Default for Limits {
             max_path_len: None,
             max_pending_entries: 16,
             max_sparse_entries: 10_000,
-            strict: true,
         }
     }
 }
@@ -172,22 +164,6 @@ impl Limits {
             max_path_len: None,
             max_pending_entries: usize::MAX,
             max_sparse_entries: 1_000_000,
-            strict: false,
-        }
-    }
-
-    /// Create strict limits suitable for untrusted archives.
-    ///
-    /// This sets conservative limits to minimize resource consumption
-    /// from potentially malicious archives.
-    #[must_use]
-    pub fn strict() -> Self {
-        Self {
-            max_metadata_size: 64 * 1024, // 64 KiB
-            max_path_len: Some(4096),
-            max_pending_entries: 8,
-            max_sparse_entries: 1000,
-            strict: true,
         }
     }
 
@@ -292,7 +268,7 @@ pub enum ParseError {
     #[error("invalid PAX sparse map: {0}")]
     InvalidPaxSparseMap(Cow<'static, str>),
 
-    /// A PAX extension value failed to parse in strict mode.
+    /// A PAX extension value failed to parse.
     #[error("invalid PAX {key} value: {value:?}")]
     InvalidPaxValue {
         /// The PAX key (e.g. "uid", "size").
@@ -605,23 +581,23 @@ impl PendingMetadata<'_> {
 ///
 /// Returns `Some((major, minor))` if `GNU.sparse.major` and
 /// `GNU.sparse.minor` are both present and parseable, `None` if
-/// the keys are absent. In strict mode, malformed values produce
-/// errors instead of being silently ignored.
-fn pax_sparse_version(pax: &[u8], strict: bool) -> Result<Option<(u64, u64)>> {
+/// the keys are absent. When `ignore_errors` is true, malformed values
+/// are silently skipped instead of producing errors.
+fn pax_sparse_version(pax: &[u8], ignore_errors: bool) -> Result<Option<(u64, u64)>> {
     let mut major = None;
     let mut minor = None;
     for ext in PaxExtensions::new(pax) {
         let ext = ext?;
         let key = match ext.key() {
             Ok(k) => k,
-            Err(_) if !strict => continue,
+            Err(_) if ignore_errors => continue,
             Err(e) => return Err(ParseError::from(e)),
         };
         match key {
             PAX_GNU_SPARSE_MAJOR => {
                 let s = match ext.value() {
                     Ok(s) => s,
-                    Err(_) if !strict => continue,
+                    Err(_) if ignore_errors => continue,
                     Err(_) => {
                         return Err(ParseError::InvalidPaxValue {
                             key: PAX_GNU_SPARSE_MAJOR,
@@ -631,7 +607,7 @@ fn pax_sparse_version(pax: &[u8], strict: bool) -> Result<Option<(u64, u64)>> {
                 };
                 match s.parse::<u64>() {
                     Ok(v) => major = Some(v),
-                    Err(_) if !strict => {}
+                    Err(_) if ignore_errors => {}
                     Err(_) => {
                         return Err(ParseError::InvalidPaxValue {
                             key: PAX_GNU_SPARSE_MAJOR,
@@ -643,7 +619,7 @@ fn pax_sparse_version(pax: &[u8], strict: bool) -> Result<Option<(u64, u64)>> {
             PAX_GNU_SPARSE_MINOR => {
                 let s = match ext.value() {
                     Ok(s) => s,
-                    Err(_) if !strict => continue,
+                    Err(_) if ignore_errors => continue,
                     Err(_) => {
                         return Err(ParseError::InvalidPaxValue {
                             key: PAX_GNU_SPARSE_MINOR,
@@ -653,7 +629,7 @@ fn pax_sparse_version(pax: &[u8], strict: bool) -> Result<Option<(u64, u64)>> {
                 };
                 match s.parse::<u64>() {
                     Ok(v) => minor = Some(v),
-                    Err(_) if !strict => {}
+                    Err(_) if ignore_errors => {}
                     Err(_) => {
                         return Err(ParseError::InvalidPaxValue {
                             key: PAX_GNU_SPARSE_MINOR,
@@ -726,6 +702,13 @@ pub struct Parser {
     ///
     /// Default: `true`.
     verify_checksums: bool,
+    /// When true, malformed PAX extension values (invalid UTF-8, unparseable
+    /// integers for uid/gid/size/mtime) are silently skipped instead of
+    /// producing errors. This matches the behavior of many real-world tar
+    /// implementations.
+    ///
+    /// Default: `false`.
+    ignore_pax_errors: bool,
 }
 
 impl Parser {
@@ -737,6 +720,7 @@ impl Parser {
             state: State::ReadHeader,
             allow_empty_path: false,
             verify_checksums: true,
+            ignore_pax_errors: false,
         }
     }
 
@@ -757,6 +741,18 @@ impl Parser {
     /// Default: `true`.
     pub fn set_verify_checksums(&mut self, verify: bool) {
         self.verify_checksums = verify;
+    }
+
+    /// Control whether malformed PAX extension values are silently ignored.
+    ///
+    /// When set to `true`, PAX values that fail to parse (invalid UTF-8,
+    /// unparseable integers for `uid`, `gid`, `size`, `mtime`) are skipped
+    /// instead of producing [`ParseError::InvalidPaxValue`] errors. This
+    /// matches the lenient behavior of many real-world tar implementations.
+    ///
+    /// Default: `false` (malformed values produce errors).
+    pub fn set_ignore_pax_errors(&mut self, ignore: bool) {
+        self.ignore_pax_errors = ignore;
     }
 
     /// Create a new parser with default limits.
@@ -919,7 +915,7 @@ impl Parser {
                 // Check for PAX v1.0 sparse before emitting — it requires
                 // reading the sparse map from the data stream.
                 let sparse_version = if let Some(pax) = slices.pax_extensions {
-                    pax_sparse_version(pax, self.limits.strict)?
+                    pax_sparse_version(pax, self.ignore_pax_errors)?
                 } else {
                     None
                 };
@@ -1040,21 +1036,21 @@ impl Parser {
                 "missing PAX extensions",
             )))?;
 
-        let strict = self.limits.strict;
+        let ignore_errors = self.ignore_pax_errors;
         let mut real_size = None;
         let mut sparse_name = None;
         for ext in PaxExtensions::new(pax) {
             let ext = ext?;
             let key = match ext.key() {
                 Ok(k) => k,
-                Err(_) if !strict => continue,
+                Err(_) if ignore_errors => continue,
                 Err(e) => return Err(ParseError::from(e)),
             };
             match key {
                 PAX_GNU_SPARSE_REALSIZE | PAX_GNU_SPARSE_SIZE => {
                     let s = match ext.value() {
                         Ok(s) => s,
-                        Err(_) if !strict => continue,
+                        Err(_) if ignore_errors => continue,
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key: PAX_GNU_SPARSE_REALSIZE,
@@ -1064,7 +1060,7 @@ impl Parser {
                     };
                     match s.parse::<u64>() {
                         Ok(v) => real_size = Some(v),
-                        Err(_) if !strict => {}
+                        Err(_) if ignore_errors => {}
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key: PAX_GNU_SPARSE_REALSIZE,
@@ -1346,16 +1342,16 @@ impl Parser {
         let mut pax_sparse_pending_offset: Option<u64> = None;
 
         if let Some(pax) = raw_pax {
-            let strict = self.limits.strict;
+            let ignore_errors = self.ignore_pax_errors;
             let extensions = PaxExtensions::new(pax);
 
-            // Helper: parse a PAX numeric value, returning Err in strict mode
-            // or Ok(None) in lenient mode when the value is unparseable.
+            // Helper: parse a PAX numeric value, returning Ok(None) when
+            // ignore_pax_errors is set and the value is unparseable.
             let parse_pax_u64 =
                 |ext: &crate::PaxExtension<'_>, key: &'static str| -> Result<Option<u64>> {
                     let s = match ext.value() {
                         Ok(s) => s,
-                        Err(_) if !strict => return Ok(None),
+                        Err(_) if ignore_errors => return Ok(None),
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key,
@@ -1365,7 +1361,7 @@ impl Parser {
                     };
                     match s.parse::<u64>() {
                         Ok(v) => Ok(Some(v)),
-                        Err(_) if !strict => Ok(None),
+                        Err(_) if ignore_errors => Ok(None),
                         Err(_) => Err(ParseError::InvalidPaxValue {
                             key,
                             value: s.to_owned().into(),
@@ -1407,7 +1403,7 @@ impl Parser {
                         // parse only the integer part.
                         let s = match ext.value() {
                             Ok(s) => s,
-                            Err(_) if !strict => continue,
+                            Err(_) if ignore_errors => continue,
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxValue {
                                     key: PAX_MTIME,
@@ -1418,7 +1414,7 @@ impl Parser {
                         let int_part = s.split('.').next().unwrap_or(s);
                         match int_part.parse::<u64>() {
                             Ok(v) => mtime = v,
-                            Err(_) if !strict => {}
+                            Err(_) if ignore_errors => {}
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxValue {
                                     key: PAX_MTIME,
@@ -1459,7 +1455,7 @@ impl Parser {
                     PAX_GNU_SPARSE_MAP => {
                         let s = match ext.value() {
                             Ok(s) => s,
-                            Err(_) if !strict => continue,
+                            Err(_) if ignore_errors => continue,
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
                                     "non-UTF8 sparse map",
@@ -1614,10 +1610,10 @@ mod tests {
     }
 
     #[test]
-    fn test_strict_limits() {
-        let limits = Limits::strict();
-        assert_eq!(limits.max_path_len, Some(4096));
-        assert!(limits.max_metadata_size < Limits::default().max_metadata_size);
+    fn test_permissive_limits_relaxed() {
+        let limits = Limits::permissive();
+        assert!(limits.max_metadata_size > Limits::default().max_metadata_size);
+        assert!(limits.max_pending_entries > Limits::default().max_pending_entries);
     }
 
     #[test]
@@ -2861,11 +2857,8 @@ mod tests {
     #[test]
     fn test_lenient_ignores_invalid_pax_uid() {
         let archive = make_archive_with_pax("uid", b"notanumber");
-        let limits = Limits {
-            strict: false,
-            ..Default::default()
-        };
-        let mut parser = Parser::new(limits);
+        let mut parser = Parser::new(Limits::default());
+        parser.set_ignore_pax_errors(true);
         let event = parser.parse(&archive).unwrap();
         match event {
             ParseEvent::Entry { entry, .. } => {
@@ -2879,11 +2872,8 @@ mod tests {
     #[test]
     fn test_lenient_ignores_invalid_pax_size() {
         let archive = make_archive_with_pax("size", b"xyz");
-        let limits = Limits {
-            strict: false,
-            ..Default::default()
-        };
-        let mut parser = Parser::new(limits);
+        let mut parser = Parser::new(Limits::default());
+        parser.set_ignore_pax_errors(true);
         let event = parser.parse(&archive).unwrap();
         match event {
             ParseEvent::Entry { entry, .. } => {
