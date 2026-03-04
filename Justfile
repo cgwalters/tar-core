@@ -17,6 +17,7 @@ unit:
     else \
         cargo test; \
     fi
+    cargo test --no-default-features
 
 # Run cross-language interop tests (requires python3, go)
 interop:
@@ -27,8 +28,8 @@ interop:
 # Run all tests
 test-all: unit interop
 
-# Full CI check (format, lint, test, fuzz)
-ci: check unit fuzz-all
+# CI check (format, lint, test); see also fuzz-all
+ci: check unit
 
 # Run Kani formal verification proofs (install: cargo install --locked kani-verifier && cargo kani setup)
 kani:

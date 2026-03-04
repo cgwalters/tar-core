@@ -46,6 +46,7 @@
 //! ```
 
 use alloc::borrow::Cow;
+use alloc::borrow::ToOwned;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -80,38 +81,37 @@ use crate::{
 /// let limits = Limits::default();
 ///
 /// // Customize limits
-/// let strict_limits = Limits {
-///     max_path_len: 1024,
-///     max_pax_size: 64 * 1024,
+/// let limits = Limits {
+///     max_metadata_size: 64 * 1024,
+///     // Set to libc::PATH_MAX when extracting to disk
+///     max_path_len: Some(4096),
 ///     ..Default::default()
 /// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// Maximum path length in bytes.
+    /// Maximum total size of all extension metadata for a single entry, in bytes.
     ///
-    /// Applies to both file paths and link targets. Paths exceeding this
-    /// limit will cause a [`ParseError::PathTooLong`] error.
-    ///
-    /// Default: 4096 bytes (Linux PATH_MAX).
-    pub max_path_len: usize,
-
-    /// Maximum size of PAX extended header data in bytes.
-    ///
-    /// This limits the total size of a single PAX 'x' entry's content.
-    /// PAX headers larger than this will cause a [`ParseError::PaxTooLarge`] error.
+    /// This is an aggregate budget: the combined size of PAX extended headers,
+    /// GNU long name, and GNU long link data for one file entry must not exceed
+    /// this limit. Exceeding it will cause a [`ParseError::MetadataTooLarge`]
+    /// error.
     ///
     /// Default: 1 MiB (1,048,576 bytes).
-    pub max_pax_size: u64,
+    pub max_metadata_size: u32,
 
-    /// Maximum size of GNU long name/link data in bytes.
+    /// Optional maximum path length in bytes.
     ///
-    /// GNU 'L' (long name) and 'K' (long link) entries should only contain
-    /// a single path. Values exceeding this limit will cause a
-    /// [`ParseError::GnuLongTooLarge`] error.
+    /// When set, paths and link targets exceeding this limit will cause a
+    /// [`ParseError::PathTooLong`] error. When `None`, no path length check
+    /// is performed (the default).
     ///
-    /// Default: 4096 bytes.
-    pub max_gnu_long_size: u64,
+    /// Callers extracting to a real filesystem should set this to
+    /// `libc::PATH_MAX` (4096 on Linux, 1024 on macOS) or the appropriate
+    /// platform constant.
+    ///
+    /// Default: `None`.
+    pub max_path_len: Option<u32>,
 
     /// Maximum number of consecutive metadata entries before an actual entry.
     ///
@@ -133,24 +133,15 @@ pub struct Limits {
     ///
     /// Default: 10000.
     pub max_sparse_entries: usize,
-
-    /// When true, PAX extension values that fail to parse (invalid UTF-8,
-    /// invalid integer for numeric fields like `uid`, `gid`, `size`, `mtime`)
-    /// cause errors instead of being silently ignored.
-    ///
-    /// Default: `true`.
-    pub strict: bool,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_path_len: 4096,
-            max_pax_size: 1024 * 1024, // 1 MiB
-            max_gnu_long_size: 4096,
+            max_metadata_size: 1024 * 1024, // 1 MiB
+            max_path_len: None,
             max_pending_entries: 16,
             max_sparse_entries: 10_000,
-            strict: true,
         }
     }
 }
@@ -169,29 +160,24 @@ impl Limits {
     #[must_use]
     pub fn permissive() -> Self {
         Self {
-            max_path_len: usize::MAX,
-            max_pax_size: u64::MAX,
-            max_gnu_long_size: u64::MAX,
+            max_metadata_size: u32::MAX,
+            max_path_len: None,
             max_pending_entries: usize::MAX,
             max_sparse_entries: 1_000_000,
-            strict: false,
         }
     }
 
-    /// Create strict limits suitable for untrusted archives.
+    /// Check a path length against the configured limit.
     ///
-    /// This sets conservative limits to minimize resource consumption
-    /// from potentially malicious archives.
-    #[must_use]
-    pub fn strict() -> Self {
-        Self {
-            max_path_len: 1024,
-            max_pax_size: 64 * 1024, // 64 KiB
-            max_gnu_long_size: 1024,
-            max_pending_entries: 8,
-            max_sparse_entries: 1000,
-            strict: true,
+    /// Returns `Ok(())` if the path is within the limit (or no limit is set),
+    /// or `Err(ParseError::PathTooLong)` if it exceeds it.
+    pub fn check_path_len(&self, len: usize) -> Result<()> {
+        if let Some(limit) = self.max_path_len {
+            if len > limit as usize {
+                return Err(ParseError::PathTooLong { len, limit });
+            }
         }
+        Ok(())
     }
 }
 
@@ -225,25 +211,19 @@ pub enum ParseError {
         /// Actual path length.
         len: usize,
         /// Configured limit.
-        limit: usize,
+        limit: u32,
     },
 
-    /// PAX extended header exceeds configured maximum size.
-    #[error("PAX header exceeds limit: {size} bytes > {limit} bytes")]
-    PaxTooLarge {
-        /// Actual PAX header size.
+    /// Extension metadata exceeds configured maximum size.
+    ///
+    /// The aggregate size of all extension data (PAX headers, GNU long
+    /// name/link) for a single entry exceeded [`Limits::max_metadata_size`].
+    #[error("metadata exceeds limit: {size} bytes > {limit} bytes")]
+    MetadataTooLarge {
+        /// Total metadata size that would result.
         size: u64,
         /// Configured limit.
-        limit: u64,
-    },
-
-    /// GNU long name/link exceeds configured maximum size.
-    #[error("GNU long name/link exceeds limit: {size} bytes > {limit} bytes")]
-    GnuLongTooLarge {
-        /// Actual GNU long name/link size.
-        size: u64,
-        /// Configured limit.
-        limit: u64,
+        limit: u32,
     },
 
     /// Duplicate GNU long name entry without an intervening actual entry.
@@ -286,15 +266,15 @@ pub enum ParseError {
 
     /// A PAX sparse map field is malformed.
     #[error("invalid PAX sparse map: {0}")]
-    InvalidPaxSparseMap(String),
+    InvalidPaxSparseMap(Cow<'static, str>),
 
-    /// A PAX extension value failed to parse in strict mode.
+    /// A PAX extension value failed to parse.
     #[error("invalid PAX {key} value: {value:?}")]
     InvalidPaxValue {
         /// The PAX key (e.g. "uid", "size").
         key: &'static str,
         /// The raw value string.
-        value: String,
+        value: Cow<'static, str>,
     },
 
     /// Entry path is empty after applying all overrides (GNU long name, PAX path, etc.).
@@ -388,7 +368,7 @@ pub enum ParseEvent<'a> {
         /// Number of bytes consumed from the input (header + padded content).
         consumed: usize,
         /// The raw PAX key-value data from the global header.
-        pax_data: Vec<u8>,
+        pax_data: &'a [u8],
     },
 
     /// Archive end marker reached (two consecutive zero blocks, or clean EOF).
@@ -410,10 +390,10 @@ impl<'a> ParseEvent<'a> {
     fn add_consumed(self, n: usize) -> Self {
         match self {
             ParseEvent::NeedData { min_bytes } => ParseEvent::NeedData {
-                min_bytes: min_bytes + n,
+                min_bytes: min_bytes.saturating_add(n),
             },
             ParseEvent::Entry { consumed, entry } => ParseEvent::Entry {
-                consumed: consumed + n,
+                consumed: consumed.saturating_add(n),
                 entry,
             },
             ParseEvent::SparseEntry {
@@ -422,17 +402,17 @@ impl<'a> ParseEvent<'a> {
                 sparse_map,
                 real_size,
             } => ParseEvent::SparseEntry {
-                consumed: consumed + n,
+                consumed: consumed.saturating_add(n),
                 entry,
                 sparse_map,
                 real_size,
             },
             ParseEvent::GlobalExtensions { consumed, pax_data } => ParseEvent::GlobalExtensions {
-                consumed: consumed + n,
+                consumed: consumed.saturating_add(n),
                 pax_data,
             },
             ParseEvent::End { consumed } => ParseEvent::End {
-                consumed: consumed + n,
+                consumed: consumed.saturating_add(n),
             },
         }
     }
@@ -497,7 +477,7 @@ pub struct ParsedEntry<'a> {
     /// so that callers can iterate all PAX key-value pairs (not just the ones
     /// tar-core resolves into struct fields). Parse it with
     /// [`PaxExtensions::new`](crate::PaxExtensions::new).
-    pub pax: Option<Vec<u8>>,
+    pub pax: Option<&'a [u8]>,
 }
 
 impl<'a> ParsedEntry<'a> {
@@ -563,13 +543,20 @@ enum ExtensionKind {
     Pax,
 }
 
-/// Pending metadata from GNU/PAX extension entries.
-#[derive(Debug, Default, Clone)]
-struct PendingMetadata {
-    gnu_long_name: Option<Vec<u8>>,
-    gnu_long_link: Option<Vec<u8>>,
-    pax_extensions: Option<Vec<u8>>,
+/// Borrowed extension data accumulated during recursive extension processing.
+///
+/// This is threaded through `parse_header` → `handle_extension` → `parse_header`
+/// calls within a single `parse()` invocation. Since extension chains are always
+/// fully resolved within one call (or discarded on `NeedData`), we can borrow
+/// directly from the input slice — no allocation needed.
+#[derive(Debug, Default, Clone, Copy)]
+struct PendingMetadata<'a> {
+    gnu_long_name: Option<&'a [u8]>,
+    gnu_long_link: Option<&'a [u8]>,
+    pax_extensions: Option<&'a [u8]>,
     count: usize,
+    /// Running total of all extension data bytes accumulated so far.
+    metadata_size: u64,
 }
 
 /// Context for GNU sparse entries, passed from `handle_gnu_sparse` to
@@ -582,18 +569,84 @@ struct SparseContext {
     ext_consumed: usize,
 }
 
-impl PendingMetadata {
+impl PendingMetadata<'_> {
     fn is_empty(&self) -> bool {
         self.gnu_long_name.is_none()
             && self.gnu_long_link.is_none()
             && self.pax_extensions.is_none()
     }
+}
 
-    fn clear(&mut self) {
-        self.gnu_long_name = None;
-        self.gnu_long_link = None;
-        self.pax_extensions = None;
-        self.count = 0;
+/// Check PAX extensions for GNU sparse version.
+///
+/// Returns `Some((major, minor))` if `GNU.sparse.major` and
+/// `GNU.sparse.minor` are both present and parseable, `None` if
+/// the keys are absent. When `ignore_errors` is true, malformed values
+/// are silently skipped instead of producing errors.
+fn pax_sparse_version(pax: &[u8], ignore_errors: bool) -> Result<Option<(u64, u64)>> {
+    let mut major = None;
+    let mut minor = None;
+    for ext in PaxExtensions::new(pax) {
+        let ext = ext?;
+        let key = match ext.key() {
+            Ok(k) => k,
+            Err(_) if ignore_errors => continue,
+            Err(e) => return Err(ParseError::from(e)),
+        };
+        match key {
+            PAX_GNU_SPARSE_MAJOR => {
+                let s = match ext.value() {
+                    Ok(s) => s,
+                    Err(_) if ignore_errors => continue,
+                    Err(_) => {
+                        return Err(ParseError::InvalidPaxValue {
+                            key: PAX_GNU_SPARSE_MAJOR,
+                            value: Cow::Borrowed("<non-UTF-8>"),
+                        })
+                    }
+                };
+                match s.parse::<u64>() {
+                    Ok(v) => major = Some(v),
+                    Err(_) if ignore_errors => {}
+                    Err(_) => {
+                        return Err(ParseError::InvalidPaxValue {
+                            key: PAX_GNU_SPARSE_MAJOR,
+                            value: s.to_owned().into(),
+                        })
+                    }
+                }
+            }
+            PAX_GNU_SPARSE_MINOR => {
+                let s = match ext.value() {
+                    Ok(s) => s,
+                    Err(_) if ignore_errors => continue,
+                    Err(_) => {
+                        return Err(ParseError::InvalidPaxValue {
+                            key: PAX_GNU_SPARSE_MINOR,
+                            value: Cow::Borrowed("<non-UTF-8>"),
+                        })
+                    }
+                };
+                match s.parse::<u64>() {
+                    Ok(v) => minor = Some(v),
+                    Err(_) if ignore_errors => {}
+                    Err(_) => {
+                        return Err(ParseError::InvalidPaxValue {
+                            key: PAX_GNU_SPARSE_MINOR,
+                            value: s.to_owned().into(),
+                        })
+                    }
+                }
+            }
+            _ => {}
+        }
+        if major.is_some() && minor.is_some() {
+            break;
+        }
+    }
+    match (major, minor) {
+        (Some(maj), Some(min)) => Ok(Some((maj, min))),
+        _ => Ok(None),
     }
 }
 
@@ -640,7 +693,6 @@ impl PendingMetadata {
 pub struct Parser {
     limits: Limits,
     state: State,
-    pending: PendingMetadata,
     /// When true, entries with empty paths are allowed through instead of
     /// returning [`ParseError::EmptyPath`].
     allow_empty_path: bool,
@@ -650,6 +702,13 @@ pub struct Parser {
     ///
     /// Default: `true`.
     verify_checksums: bool,
+    /// When true, malformed PAX extension values (invalid UTF-8, unparseable
+    /// integers for uid/gid/size/mtime) are silently skipped instead of
+    /// producing errors. This matches the behavior of many real-world tar
+    /// implementations.
+    ///
+    /// Default: `false`.
+    ignore_pax_errors: bool,
 }
 
 impl Parser {
@@ -659,9 +718,9 @@ impl Parser {
         Self {
             limits,
             state: State::ReadHeader,
-            pending: PendingMetadata::default(),
             allow_empty_path: false,
             verify_checksums: true,
+            ignore_pax_errors: false,
         }
     }
 
@@ -682,6 +741,18 @@ impl Parser {
     /// Default: `true`.
     pub fn set_verify_checksums(&mut self, verify: bool) {
         self.verify_checksums = verify;
+    }
+
+    /// Control whether malformed PAX extension values are silently ignored.
+    ///
+    /// When set to `true`, PAX values that fail to parse (invalid UTF-8,
+    /// unparseable integers for `uid`, `gid`, `size`, `mtime`) are skipped
+    /// instead of producing [`ParseError::InvalidPaxValue`] errors. This
+    /// matches the lenient behavior of many real-world tar implementations.
+    ///
+    /// Default: `false` (malformed values produce errors).
+    pub fn set_ignore_pax_errors(&mut self, ignore: bool) {
+        self.ignore_pax_errors = ignore;
     }
 
     /// Create a new parser with default limits.
@@ -720,12 +791,16 @@ impl Parser {
     pub fn parse<'a>(&mut self, input: &'a [u8]) -> Result<ParseEvent<'a>> {
         match self.state {
             State::Done => Ok(ParseEvent::End { consumed: 0 }),
-            State::ReadHeader => self.parse_header(input),
+            State::ReadHeader => self.parse_header(input, PendingMetadata::default()),
         }
     }
 
     /// Parse a header from the input.
-    fn parse_header<'a>(&mut self, input: &'a [u8]) -> Result<ParseEvent<'a>> {
+    fn parse_header<'a>(
+        &mut self,
+        input: &'a [u8],
+        slices: PendingMetadata<'a>,
+    ) -> Result<ParseEvent<'a>> {
         // Need at least one header block
         if input.len() < HEADER_SIZE {
             return Ok(ParseEvent::NeedData {
@@ -752,7 +827,7 @@ impl Parser {
             let second_block = &input[HEADER_SIZE..2 * HEADER_SIZE];
             if second_block.iter().all(|&b| b == 0) {
                 self.state = State::Done;
-                if !self.pending.is_empty() {
+                if !slices.is_empty() {
                     return Err(ParseError::OrphanedMetadata);
                 }
                 return Ok(ParseEvent::End {
@@ -762,14 +837,14 @@ impl Parser {
             // Not end of archive — single stray zero block; skip it and
             // continue with the next block as a header.
             return self
-                .parse_header(&input[HEADER_SIZE..])
+                .parse_header(&input[HEADER_SIZE..], slices)
                 .map(|e| e.add_consumed(HEADER_SIZE));
         }
 
         // Check pending entry limit
-        if self.pending.count > self.limits.max_pending_entries {
+        if slices.count > self.limits.max_pending_entries {
             return Err(ParseError::TooManyPendingEntries {
-                count: self.pending.count,
+                count: slices.count,
                 limit: self.limits.max_pending_entries,
             });
         }
@@ -794,24 +869,24 @@ impl Parser {
         let is_extension_format = header.is_gnu() || header.is_ustar();
         match entry_type {
             EntryType::GnuLongName if is_extension_format => {
-                self.handle_extension(input, size, padded_size, ExtensionKind::GnuLongName)
+                self.handle_extension(input, size, padded_size, ExtensionKind::GnuLongName, slices)
             }
             EntryType::GnuLongLink if is_extension_format => {
-                self.handle_extension(input, size, padded_size, ExtensionKind::GnuLongLink)
+                self.handle_extension(input, size, padded_size, ExtensionKind::GnuLongLink, slices)
             }
             EntryType::XHeader if is_extension_format => {
-                self.handle_extension(input, size, padded_size, ExtensionKind::Pax)
+                self.handle_extension(input, size, padded_size, ExtensionKind::Pax, slices)
             }
             // Global PAX headers (type 'g') are defined by POSIX
             // independently of the UStar/GNU magic, so we always handle
             // them here. Routing through emit_entry would fail because
             // global headers have arbitrary metadata fields.
             EntryType::XGlobalHeader => {
-                // Check size limit (same as local PAX headers)
-                if size > self.limits.max_pax_size {
-                    return Err(ParseError::PaxTooLarge {
+                // Check size limit
+                if size > self.limits.max_metadata_size as u64 {
+                    return Err(ParseError::MetadataTooLarge {
                         size,
-                        limit: self.limits.max_pax_size,
+                        limit: self.limits.max_metadata_size,
                     });
                 }
 
@@ -826,7 +901,7 @@ impl Parser {
 
                 let content_start = HEADER_SIZE;
                 let content_end = content_start + size as usize;
-                let pax_data = input[content_start..content_end].to_vec();
+                let pax_data = &input[content_start..content_end];
 
                 Ok(ParseEvent::GlobalExtensions {
                     consumed: total_size as usize,
@@ -834,17 +909,22 @@ impl Parser {
                 })
             }
             EntryType::GnuSparse if is_extension_format => {
-                self.handle_gnu_sparse(input, header, size)
+                self.handle_gnu_sparse(input, header, size, slices)
             }
             _ => {
                 // Check for PAX v1.0 sparse before emitting — it requires
                 // reading the sparse map from the data stream.
-                if self.pending_pax_sparse_version()? == Some((1, 0)) {
-                    self.handle_pax_sparse_v1(input, header, size)
+                let sparse_version = if let Some(pax) = slices.pax_extensions {
+                    pax_sparse_version(pax, self.ignore_pax_errors)?
+                } else {
+                    None
+                };
+                if sparse_version == Some((1, 0)) {
+                    self.handle_pax_sparse_v1(input, header, size, slices)
                 } else {
                     // Actual entry — emit_entry handles v0.0/v0.1 PAX sparse
                     // inline during PAX extension processing.
-                    self.emit_entry(header, size, None)
+                    self.emit_entry(header, size, None, slices)
                 }
             }
         }
@@ -852,25 +932,25 @@ impl Parser {
 
     /// Process a GNU long name/link or PAX extension entry.
     ///
-    /// Extracts the extension data, adds it to pending metadata, and
-    /// recurses to parse the next header. If the recursive call returns
-    /// NeedData (not enough input for the following header), the pending
-    /// state is restored so the caller can retry with more data and
-    /// re-parse the entire extension chain from scratch.
+    /// Extracts the extension data as a borrowed slice (zero-copy), adds it
+    /// to `slices`, and recurses to parse the next header. No state is stored
+    /// in `self`, so on `NeedData` the recursion simply unwinds — the caller
+    /// retries from scratch, re-parsing the extension chain.
     fn handle_extension<'a>(
         &mut self,
         input: &'a [u8],
         size: u64,
         padded_size: u64,
         kind: ExtensionKind,
+        slices: PendingMetadata<'a>,
     ) -> Result<ParseEvent<'a>> {
         // Check for duplicate
-        let slot = match kind {
-            ExtensionKind::GnuLongName => &self.pending.gnu_long_name,
-            ExtensionKind::GnuLongLink => &self.pending.gnu_long_link,
-            ExtensionKind::Pax => &self.pending.pax_extensions,
+        let has_dup = match kind {
+            ExtensionKind::GnuLongName => slices.gnu_long_name.is_some(),
+            ExtensionKind::GnuLongLink => slices.gnu_long_link.is_some(),
+            ExtensionKind::Pax => slices.pax_extensions.is_some(),
         };
-        if slot.is_some() {
+        if has_dup {
             return Err(match kind {
                 ExtensionKind::GnuLongName => ParseError::DuplicateGnuLongName,
                 ExtensionKind::GnuLongLink => ParseError::DuplicateGnuLongLink,
@@ -878,25 +958,12 @@ impl Parser {
             });
         }
 
-        // Check size limit
-        let max_size = match kind {
-            ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink => {
-                self.limits.max_gnu_long_size
-            }
-            ExtensionKind::Pax => self.limits.max_pax_size,
-        };
-        if size > max_size {
-            return Err(match kind {
-                ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink => {
-                    ParseError::GnuLongTooLarge {
-                        size,
-                        limit: max_size,
-                    }
-                }
-                ExtensionKind::Pax => ParseError::PaxTooLarge {
-                    size,
-                    limit: max_size,
-                },
+        // Check aggregate metadata size limit
+        let new_metadata_size = slices.metadata_size + size;
+        if new_metadata_size > self.limits.max_metadata_size as u64 {
+            return Err(ParseError::MetadataTooLarge {
+                size: new_metadata_size,
+                limit: self.limits.max_metadata_size,
             });
         }
 
@@ -909,128 +976,36 @@ impl Parser {
             });
         }
 
-        // Extract content
+        // Extract content as a borrowed slice (zero-copy)
         let content_start = HEADER_SIZE;
         let content_end = content_start + size as usize;
-        let mut data = input[content_start..content_end].to_vec();
+        let mut data: &'a [u8] = &input[content_start..content_end];
 
         // Strip trailing null for GNU long name/link
         if matches!(
             kind,
             ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink
         ) {
-            if data.last() == Some(&0) {
-                data.pop();
+            if let Some(trimmed) = data.strip_suffix(&[0]) {
+                data = trimmed;
             }
-            if data.len() > self.limits.max_path_len {
-                return Err(ParseError::PathTooLong {
-                    len: data.len(),
-                    limit: self.limits.max_path_len,
-                });
-            }
+            self.limits.check_path_len(data.len())?;
         }
 
-        // Save current pending state, apply the new extension data,
-        // and recurse. If the recursive call needs more data, restore
-        // the saved state so the caller can retry from scratch.
-        let saved = core::mem::take(&mut self.pending);
-        self.pending = PendingMetadata {
-            count: saved.count + 1,
-            ..saved.clone()
+        // Build new pending metadata with the added extension data
+        let mut new_slices = PendingMetadata {
+            count: slices.count + 1,
+            metadata_size: new_metadata_size,
+            ..slices
         };
-        let slot = match kind {
-            ExtensionKind::GnuLongName => &mut self.pending.gnu_long_name,
-            ExtensionKind::GnuLongLink => &mut self.pending.gnu_long_link,
-            ExtensionKind::Pax => &mut self.pending.pax_extensions,
-        };
-        *slot = Some(data);
-
-        let result = self
-            .parse_header(&input[total_size as usize..])
-            .map(|e| e.add_consumed(total_size as usize));
-
-        if matches!(result, Ok(ParseEvent::NeedData { .. })) {
-            self.pending = saved;
+        match kind {
+            ExtensionKind::GnuLongName => new_slices.gnu_long_name = Some(data),
+            ExtensionKind::GnuLongLink => new_slices.gnu_long_link = Some(data),
+            ExtensionKind::Pax => new_slices.pax_extensions = Some(data),
         }
-        result
-    }
 
-    /// Check pending PAX extensions for GNU sparse version.
-    ///
-    /// Returns `Some((major, minor))` if `GNU.sparse.major` and
-    /// `GNU.sparse.minor` are both present and parseable, `None` if
-    /// the keys are absent. In strict mode, malformed values produce
-    /// errors instead of being silently ignored.
-    fn pending_pax_sparse_version(&self) -> Result<Option<(u64, u64)>> {
-        let pax = match self.pending.pax_extensions.as_ref() {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        let strict = self.limits.strict;
-        let mut major = None;
-        let mut minor = None;
-        for ext in PaxExtensions::new(pax) {
-            let ext = ext?;
-            let key = match ext.key() {
-                Ok(k) => k,
-                Err(_) if !strict => continue,
-                Err(e) => return Err(ParseError::from(e)),
-            };
-            match key {
-                PAX_GNU_SPARSE_MAJOR => {
-                    let s = match ext.value() {
-                        Ok(s) => s,
-                        Err(_) if !strict => continue,
-                        Err(_) => {
-                            return Err(ParseError::InvalidPaxValue {
-                                key: PAX_GNU_SPARSE_MAJOR,
-                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
-                            })
-                        }
-                    };
-                    match s.parse::<u64>() {
-                        Ok(v) => major = Some(v),
-                        Err(_) if !strict => {}
-                        Err(_) => {
-                            return Err(ParseError::InvalidPaxValue {
-                                key: PAX_GNU_SPARSE_MAJOR,
-                                value: s.into(),
-                            })
-                        }
-                    }
-                }
-                PAX_GNU_SPARSE_MINOR => {
-                    let s = match ext.value() {
-                        Ok(s) => s,
-                        Err(_) if !strict => continue,
-                        Err(_) => {
-                            return Err(ParseError::InvalidPaxValue {
-                                key: PAX_GNU_SPARSE_MINOR,
-                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
-                            })
-                        }
-                    };
-                    match s.parse::<u64>() {
-                        Ok(v) => minor = Some(v),
-                        Err(_) if !strict => {}
-                        Err(_) => {
-                            return Err(ParseError::InvalidPaxValue {
-                                key: PAX_GNU_SPARSE_MINOR,
-                                value: s.into(),
-                            })
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if major.is_some() && minor.is_some() {
-                break;
-            }
-        }
-        match (major, minor) {
-            (Some(maj), Some(min)) => Ok(Some((maj, min))),
-            _ => Ok(None),
-        }
+        self.parse_header(&input[total_size as usize..], new_slices)
+            .map(|e| e.add_consumed(total_size as usize))
     }
 
     /// Handle a PAX v1.0 sparse entry.
@@ -1052,56 +1027,58 @@ impl Parser {
         input: &'a [u8],
         header: &'a Header,
         size: u64,
+        slices: PendingMetadata<'a>,
     ) -> Result<ParseEvent<'a>> {
         // Extract sparse metadata from PAX extensions.
-        let pax = self
-            .pending
+        let pax = slices
             .pax_extensions
-            .as_ref()
-            .ok_or_else(|| ParseError::InvalidPaxSparseMap("missing PAX extensions".into()))?;
+            .ok_or(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                "missing PAX extensions",
+            )))?;
 
-        let strict = self.limits.strict;
+        let ignore_errors = self.ignore_pax_errors;
         let mut real_size = None;
         let mut sparse_name = None;
         for ext in PaxExtensions::new(pax) {
             let ext = ext?;
             let key = match ext.key() {
                 Ok(k) => k,
-                Err(_) if !strict => continue,
+                Err(_) if ignore_errors => continue,
                 Err(e) => return Err(ParseError::from(e)),
             };
             match key {
                 PAX_GNU_SPARSE_REALSIZE | PAX_GNU_SPARSE_SIZE => {
                     let s = match ext.value() {
                         Ok(s) => s,
-                        Err(_) if !strict => continue,
+                        Err(_) if ignore_errors => continue,
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key: PAX_GNU_SPARSE_REALSIZE,
-                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                                value: Cow::Borrowed("<non-UTF-8>"),
                             })
                         }
                     };
                     match s.parse::<u64>() {
                         Ok(v) => real_size = Some(v),
-                        Err(_) if !strict => {}
+                        Err(_) if ignore_errors => {}
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key: PAX_GNU_SPARSE_REALSIZE,
-                                value: s.into(),
+                                value: s.to_owned().into(),
                             })
                         }
                     }
                 }
                 PAX_GNU_SPARSE_NAME => {
-                    sparse_name = Some(ext.value_bytes().to_vec());
+                    sparse_name = Some(ext.value_bytes());
                 }
                 _ => {}
             }
         }
 
-        let real_size = real_size
-            .ok_or_else(|| ParseError::InvalidPaxSparseMap("missing GNU.sparse.realsize".into()))?;
+        let real_size = real_size.ok_or(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+            "missing GNU.sparse.realsize",
+        )))?;
 
         // The sparse map data starts right after the header (at offset
         // HEADER_SIZE within the input). We need to parse it without
@@ -1124,16 +1101,16 @@ impl Parser {
             let s = match core::str::from_utf8(line) {
                 Ok(s) => s,
                 Err(_) => {
-                    return Some(Err(ParseError::InvalidPaxSparseMap(
-                        "non-UTF8 in sparse map".into(),
-                    )))
+                    return Some(Err(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                        "non-UTF8 in sparse map",
+                    ))))
                 }
             };
             match s.parse::<u64>() {
                 Ok(v) => Some(Ok(v)),
-                Err(_) => Some(Err(ParseError::InvalidPaxSparseMap(format!(
-                    "invalid decimal: {s:?}"
-                )))),
+                Err(_) => Some(Err(ParseError::InvalidPaxSparseMap(
+                    format!("invalid decimal: {s:?}").into(),
+                ))),
             }
         };
 
@@ -1191,9 +1168,11 @@ impl Parser {
 
         // The remaining content size is the original size minus the
         // sparse map prefix (including padding).
-        let content_size = size.checked_sub(map_size as u64).ok_or_else(|| {
-            ParseError::InvalidPaxSparseMap("sparse map prefix larger than entry size".into())
-        })?;
+        let content_size =
+            size.checked_sub(map_size as u64)
+                .ok_or(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                    "sparse map prefix larger than entry size",
+                )))?;
 
         let sparse_ctx = SparseContext {
             sparse_map,
@@ -1202,18 +1181,18 @@ impl Parser {
             ext_consumed: map_size,
         };
 
-        // Override the path with GNU.sparse.name if present.
-        if let Some(name) = sparse_name {
-            // Stash in pending so emit_entry picks it up. We don't use
-            // gnu_long_name because that has different semantics (no
-            // trailing NUL). Instead we'll handle it after emit_entry
-            // returns, or we can pass it through the sparse context.
-            // Actually, the cleanest way: temporarily store it in
-            // gnu_long_name so emit_entry applies it.
-            self.pending.gnu_long_name = Some(name);
-        }
+        // Override the path with GNU.sparse.name if present by
+        // stashing it in the slices so emit_entry picks it up.
+        let slices = if let Some(name) = sparse_name {
+            PendingMetadata {
+                gnu_long_name: Some(name),
+                ..slices
+            }
+        } else {
+            slices
+        };
 
-        self.emit_entry(header, content_size, Some(sparse_ctx))
+        self.emit_entry(header, content_size, Some(sparse_ctx), slices)
     }
 
     /// Handle a GNU sparse entry (type 'S').
@@ -1227,6 +1206,7 @@ impl Parser {
         input: &'a [u8],
         header: &'a Header,
         size: u64,
+        slices: PendingMetadata<'a>,
     ) -> Result<ParseEvent<'a>> {
         let gnu = header.try_as_gnu().ok_or(ParseError::SparseNotGnu)?;
         let real_size = gnu.real_size()?;
@@ -1298,7 +1278,7 @@ impl Parser {
             ext_consumed,
         };
 
-        self.emit_entry(header, size, Some(sparse_ctx))
+        self.emit_entry(header, size, Some(sparse_ctx), slices)
     }
 
     fn emit_entry<'a>(
@@ -1306,6 +1286,7 @@ impl Parser {
         header: &'a Header,
         size: u64,
         sparse: Option<SparseContext>,
+        slices: PendingMetadata<'a>,
     ) -> Result<ParseEvent<'a>> {
         // Start with header values
         let mut path: Cow<'a, [u8]> = Cow::Borrowed(header.path_bytes());
@@ -1335,13 +1316,13 @@ impl Parser {
         }
 
         // Apply GNU long name (overrides header + prefix)
-        if let Some(long_name) = self.pending.gnu_long_name.take() {
-            path = Cow::Owned(long_name);
+        if let Some(long_name) = slices.gnu_long_name {
+            path = Cow::Borrowed(long_name);
         }
 
         // Apply GNU long link
-        if let Some(long_link) = self.pending.gnu_long_link.take() {
-            link_target = Some(Cow::Owned(long_link));
+        if let Some(long_link) = slices.gnu_long_link {
+            link_target = Some(Cow::Borrowed(long_link));
         } else {
             let header_link = header.link_name_bytes();
             if !header_link.is_empty() {
@@ -1350,40 +1331,40 @@ impl Parser {
         }
 
         // Apply PAX extensions (highest priority)
-        let raw_pax = self.pending.pax_extensions.take();
+        let raw_pax = slices.pax_extensions;
 
         // PAX sparse v0.0/v0.1 tracking. v0.0 uses repeated offset/numbytes
         // pairs; v0.1 uses a single comma-separated map string.
         let mut pax_sparse_map: Option<Vec<SparseEntry>> = None;
         let mut pax_sparse_real_size: Option<u64> = None;
-        let mut pax_sparse_name: Option<Vec<u8>> = None;
+        let mut pax_sparse_name: Option<&'a [u8]> = None;
         // v0.0: current offset waiting for its numbytes pair
         let mut pax_sparse_pending_offset: Option<u64> = None;
 
-        if let Some(ref pax) = raw_pax {
-            let strict = self.limits.strict;
+        if let Some(pax) = raw_pax {
+            let ignore_errors = self.ignore_pax_errors;
             let extensions = PaxExtensions::new(pax);
 
-            // Helper: parse a PAX numeric value, returning Err in strict mode
-            // or Ok(None) in lenient mode when the value is unparseable.
+            // Helper: parse a PAX numeric value, returning Ok(None) when
+            // ignore_pax_errors is set and the value is unparseable.
             let parse_pax_u64 =
                 |ext: &crate::PaxExtension<'_>, key: &'static str| -> Result<Option<u64>> {
                     let s = match ext.value() {
                         Ok(s) => s,
-                        Err(_) if !strict => return Ok(None),
+                        Err(_) if ignore_errors => return Ok(None),
                         Err(_) => {
                             return Err(ParseError::InvalidPaxValue {
                                 key,
-                                value: String::from_utf8_lossy(ext.value_bytes()).into(),
+                                value: Cow::Borrowed("<non-UTF-8>"),
                             })
                         }
                     };
                     match s.parse::<u64>() {
                         Ok(v) => Ok(Some(v)),
-                        Err(_) if !strict => Ok(None),
+                        Err(_) if ignore_errors => Ok(None),
                         Err(_) => Err(ParseError::InvalidPaxValue {
                             key,
-                            value: s.into(),
+                            value: s.to_owned().into(),
                         }),
                     }
                 };
@@ -1395,22 +1376,12 @@ impl Parser {
 
                 match key {
                     PAX_PATH => {
-                        if value.len() > self.limits.max_path_len {
-                            return Err(ParseError::PathTooLong {
-                                len: value.len(),
-                                limit: self.limits.max_path_len,
-                            });
-                        }
-                        path = Cow::Owned(value.to_vec());
+                        self.limits.check_path_len(value.len())?;
+                        path = Cow::Borrowed(value);
                     }
                     PAX_LINKPATH => {
-                        if value.len() > self.limits.max_path_len {
-                            return Err(ParseError::PathTooLong {
-                                len: value.len(),
-                                limit: self.limits.max_path_len,
-                            });
-                        }
-                        link_target = Some(Cow::Owned(value.to_vec()));
+                        self.limits.check_path_len(value.len())?;
+                        link_target = Some(Cow::Borrowed(value));
                     }
                     PAX_SIZE => {
                         if let Some(v) = parse_pax_u64(&ext, PAX_SIZE)? {
@@ -1432,31 +1403,31 @@ impl Parser {
                         // parse only the integer part.
                         let s = match ext.value() {
                             Ok(s) => s,
-                            Err(_) if !strict => continue,
+                            Err(_) if ignore_errors => continue,
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxValue {
                                     key: PAX_MTIME,
-                                    value: String::from_utf8_lossy(value).into(),
+                                    value: Cow::Borrowed("<non-UTF-8>"),
                                 })
                             }
                         };
                         let int_part = s.split('.').next().unwrap_or(s);
                         match int_part.parse::<u64>() {
                             Ok(v) => mtime = v,
-                            Err(_) if !strict => {}
+                            Err(_) if ignore_errors => {}
                             Err(_) => {
                                 return Err(ParseError::InvalidPaxValue {
                                     key: PAX_MTIME,
-                                    value: s.into(),
+                                    value: s.to_owned().into(),
                                 })
                             }
                         }
                     }
                     PAX_UNAME => {
-                        uname = Some(Cow::Owned(value.to_vec()));
+                        uname = Some(Cow::Borrowed(value));
                     }
                     PAX_GNAME => {
-                        gname = Some(Cow::Owned(value.to_vec()));
+                        gname = Some(Cow::Borrowed(value));
                     }
 
                     // PAX sparse v0.0: repeated offset/numbytes pairs
@@ -1484,19 +1455,19 @@ impl Parser {
                     PAX_GNU_SPARSE_MAP => {
                         let s = match ext.value() {
                             Ok(s) => s,
-                            Err(_) if !strict => continue,
+                            Err(_) if ignore_errors => continue,
                             Err(_) => {
-                                return Err(ParseError::InvalidPaxSparseMap(
-                                    "non-UTF8 sparse map".into(),
-                                ))
+                                return Err(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                                    "non-UTF8 sparse map",
+                                )))
                             }
                         };
                         let mut map = Vec::new();
                         let parts: Vec<&str> = s.split(',').filter(|p| !p.is_empty()).collect();
                         if parts.len() % 2 != 0 {
-                            return Err(ParseError::InvalidPaxSparseMap(
-                                "odd number of values in GNU.sparse.map".into(),
-                            ));
+                            return Err(ParseError::InvalidPaxSparseMap(Cow::Borrowed(
+                                "odd number of values in GNU.sparse.map",
+                            )));
                         }
                         for pair in parts.chunks(2) {
                             if map.len() >= self.limits.max_sparse_entries {
@@ -1506,16 +1477,14 @@ impl Parser {
                                 });
                             }
                             let offset = pair[0].parse::<u64>().map_err(|_| {
-                                ParseError::InvalidPaxSparseMap(format!(
-                                    "invalid offset: {:?}",
-                                    pair[0]
-                                ))
+                                ParseError::InvalidPaxSparseMap(
+                                    format!("invalid offset: {:?}", pair[0]).into(),
+                                )
                             })?;
                             let length = pair[1].parse::<u64>().map_err(|_| {
-                                ParseError::InvalidPaxSparseMap(format!(
-                                    "invalid length: {:?}",
-                                    pair[1]
-                                ))
+                                ParseError::InvalidPaxSparseMap(
+                                    format!("invalid length: {:?}", pair[1]).into(),
+                                )
                             })?;
                             map.push(SparseEntry { offset, length });
                         }
@@ -1529,13 +1498,8 @@ impl Parser {
                         }
                     }
                     PAX_GNU_SPARSE_NAME => {
-                        if value.len() > self.limits.max_path_len {
-                            return Err(ParseError::PathTooLong {
-                                len: value.len(),
-                                limit: self.limits.max_path_len,
-                            });
-                        }
-                        pax_sparse_name = Some(value.to_vec());
+                        self.limits.check_path_len(value.len())?;
+                        pax_sparse_name = Some(value);
                     }
 
                     // Skip version fields — already handled in
@@ -1544,10 +1508,8 @@ impl Parser {
 
                     _ => {
                         if let Some(attr_name) = key.strip_prefix(PAX_SCHILY_XATTR) {
-                            xattrs.push((
-                                Cow::Owned(attr_name.as_bytes().to_vec()),
-                                Cow::Owned(value.to_vec()),
-                            ));
+                            xattrs
+                                .push((Cow::Borrowed(attr_name.as_bytes()), Cow::Borrowed(value)));
                         }
                     }
                 }
@@ -1556,11 +1518,8 @@ impl Parser {
 
         // Apply PAX sparse name override (highest priority for path).
         if let Some(name) = pax_sparse_name {
-            path = Cow::Owned(name);
+            path = Cow::Borrowed(name);
         }
-
-        // Clear pending metadata
-        self.pending.clear();
 
         // Normalize: empty optional byte fields are semantically equivalent to
         // absent.  PAX overrides and GNU long link can set empty values that
@@ -1581,12 +1540,7 @@ impl Parser {
         }
 
         // Validate final path length
-        if path.len() > self.limits.max_path_len {
-            return Err(ParseError::PathTooLong {
-                len: path.len(),
-                limit: self.limits.max_path_len,
-            });
-        }
+        self.limits.check_path_len(path.len())?;
 
         let entry = ParsedEntry {
             header,
@@ -1643,24 +1597,23 @@ mod tests {
     #[test]
     fn test_default_limits() {
         let limits = Limits::default();
-        assert_eq!(limits.max_path_len, 4096);
-        assert_eq!(limits.max_pax_size, 1024 * 1024);
-        assert_eq!(limits.max_gnu_long_size, 4096);
+        assert_eq!(limits.max_metadata_size, 1024 * 1024);
+        assert_eq!(limits.max_path_len, None);
         assert_eq!(limits.max_pending_entries, 16);
     }
 
     #[test]
     fn test_permissive_limits() {
         let limits = Limits::permissive();
-        assert_eq!(limits.max_path_len, usize::MAX);
-        assert_eq!(limits.max_pax_size, u64::MAX);
+        assert_eq!(limits.max_metadata_size, u32::MAX);
+        assert_eq!(limits.max_path_len, None);
     }
 
     #[test]
-    fn test_strict_limits() {
-        let limits = Limits::strict();
-        assert!(limits.max_path_len < Limits::default().max_path_len);
-        assert!(limits.max_pax_size < Limits::default().max_pax_size);
+    fn test_permissive_limits_relaxed() {
+        let limits = Limits::permissive();
+        assert!(limits.max_metadata_size > Limits::default().max_metadata_size);
+        assert!(limits.max_pending_entries > Limits::default().max_pending_entries);
     }
 
     #[test]
@@ -2157,7 +2110,7 @@ mod tests {
                 assert_eq!(entry.xattrs.len(), 1);
 
                 // Raw PAX data is preserved
-                let raw = entry.pax.as_ref().expect("pax should be Some");
+                let raw = entry.pax.expect("pax should be Some");
                 let exts = PaxExtensions::new(raw);
                 let keys: Vec<&str> = exts
                     .filter_map(|e| e.ok())
@@ -2301,7 +2254,7 @@ mod tests {
 
     #[test]
     fn test_parser_global_pax_header_too_large() {
-        // Global PAX header exceeding max_pax_size should error
+        // Global PAX header exceeding max_metadata_size should error
         let large_value = "x".repeat(1000);
 
         let mut archive = Vec::new();
@@ -2313,13 +2266,13 @@ mod tests {
         archive.extend(zeroes(1024));
 
         let limits = Limits {
-            max_pax_size: 100,
+            max_metadata_size: 100,
             ..Default::default()
         };
         let mut parser = Parser::new(limits);
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(ParseError::PaxTooLarge { .. })));
+        assert!(matches!(result, Err(ParseError::MetadataTooLarge { .. })));
     }
 
     #[test]
@@ -2617,13 +2570,13 @@ mod tests {
         archive.extend(zeroes(1024));
 
         let limits = Limits {
-            max_gnu_long_size: 100,
+            max_metadata_size: 100,
             ..Default::default()
         };
         let mut parser = Parser::new(limits);
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(ParseError::GnuLongTooLarge { .. })));
+        assert!(matches!(result, Err(ParseError::MetadataTooLarge { .. })));
     }
 
     #[test]
@@ -2636,7 +2589,7 @@ mod tests {
         archive.extend(zeroes(1024));
 
         let limits = Limits {
-            max_path_len: 100,
+            max_path_len: Some(100),
             ..Default::default()
         };
         let mut parser = Parser::new(limits);
@@ -2653,7 +2606,7 @@ mod tests {
 
     #[test]
     fn test_parser_pax_too_large() {
-        // Create a PAX header that exceeds the size limit
+        // Create a PAX header that exceeds the metadata size limit
         let large_value = "x".repeat(1000);
 
         let mut archive = Vec::new();
@@ -2662,13 +2615,13 @@ mod tests {
         archive.extend(zeroes(1024));
 
         let limits = Limits {
-            max_pax_size: 100,
+            max_metadata_size: 100,
             ..Default::default()
         };
         let mut parser = Parser::new(limits);
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(ParseError::PaxTooLarge { .. })));
+        assert!(matches!(result, Err(ParseError::MetadataTooLarge { .. })));
     }
 
     // =========================================================================
@@ -2904,11 +2857,8 @@ mod tests {
     #[test]
     fn test_lenient_ignores_invalid_pax_uid() {
         let archive = make_archive_with_pax("uid", b"notanumber");
-        let limits = Limits {
-            strict: false,
-            ..Default::default()
-        };
-        let mut parser = Parser::new(limits);
+        let mut parser = Parser::new(Limits::default());
+        parser.set_ignore_pax_errors(true);
         let event = parser.parse(&archive).unwrap();
         match event {
             ParseEvent::Entry { entry, .. } => {
@@ -2922,11 +2872,8 @@ mod tests {
     #[test]
     fn test_lenient_ignores_invalid_pax_size() {
         let archive = make_archive_with_pax("size", b"xyz");
-        let limits = Limits {
-            strict: false,
-            ..Default::default()
-        };
-        let mut parser = Parser::new(limits);
+        let mut parser = Parser::new(Limits::default());
+        parser.set_ignore_pax_errors(true);
         let event = parser.parse(&archive).unwrap();
         match event {
             ParseEvent::Entry { entry, .. } => {
@@ -4058,6 +4005,66 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Regression test: `add_consumed` must not overflow when chained
+    /// extension headers declare very large sizes.
+    ///
+    /// With `Limits::permissive()` (`max_metadata_size = u32::MAX`),
+    /// extension headers can declare sizes close to `u32::MAX`.  When
+    /// `handle_extension` recurses and the inner call returns `NeedData`,
+    /// `add_consumed(total_size)` is applied on unwind at each level.
+    /// Before the fix, `min_bytes + n` used plain `+` and could overflow
+    /// `usize` (especially on 32-bit targets).  The fix uses
+    /// `saturating_add`.  This test verifies the parser returns `NeedData`
+    /// (or an error) without panicking.
+    #[test]
+    fn test_add_consumed_no_overflow() {
+        // First extension: a complete GNU long name ('L') with a small
+        // payload so the parser can fully consume it and recurse.
+        let long_name = b"a]long/path".to_vec();
+        let gnu_entry = make_gnu_long_name(&long_name);
+        let first_entry_size = gnu_entry.len(); // 1024 bytes (header + padded name)
+
+        // Second extension: a PAX ('x') header that declares a size close
+        // to u32::MAX.  We only provide the header—not the content—so the
+        // recursive call in handle_extension will return NeedData with
+        // min_bytes ≈ pax_size + 512.  On unwind, add_consumed adds
+        // first_entry_size, giving min_bytes ≈ pax_size + 512 + 1024.
+        // On 32-bit this would overflow without saturating_add.
+        let pax_size: u64 = u32::MAX as u64 - long_name.len() as u64 - 512;
+        let pax_header = make_header(b"PaxHeaders/file", pax_size, b'x');
+
+        // Build input: complete GNU long name entry + PAX header only (no
+        // PAX content).
+        let mut input = Vec::with_capacity(first_entry_size + HEADER_SIZE);
+        input.extend_from_slice(&gnu_entry);
+        input.extend_from_slice(&pax_header);
+
+        let mut parser = Parser::new(Limits::permissive());
+        let result = parser.parse(&input);
+
+        // The parser must not panic.  It should return NeedData (because the
+        // PAX content is missing) or an error—both are acceptable.
+        match result {
+            Ok(ParseEvent::NeedData { min_bytes }) => {
+                // min_bytes must be at least the PAX entry's total_size
+                // (header + padded content), and must not have wrapped to
+                // a small value due to overflow.
+                assert!(
+                    min_bytes > HEADER_SIZE,
+                    "min_bytes should be large, got {min_bytes}"
+                );
+            }
+            Err(_) => {
+                // An error (e.g. metadata too large) is also acceptable;
+                // the important thing is no panic from arithmetic overflow.
+            }
+            other => panic!(
+                "Expected NeedData or Err for truncated extension chain, got {:?}",
+                other
+            ),
         }
     }
 }
