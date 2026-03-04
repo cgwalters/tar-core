@@ -34,3 +34,11 @@ jobs:
         run: just generate-corpus
       - name: Fuzz all targets (15 minutes each)
         run: just fuzz-all 900
+      - name: Upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: |
+            fuzz/artifacts/
+            target/fuzz-logs/
