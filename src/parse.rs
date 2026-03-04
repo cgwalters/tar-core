@@ -390,10 +390,10 @@ impl<'a> ParseEvent<'a> {
     fn add_consumed(self, n: usize) -> Self {
         match self {
             ParseEvent::NeedData { min_bytes } => ParseEvent::NeedData {
-                min_bytes: min_bytes + n,
+                min_bytes: min_bytes.saturating_add(n),
             },
             ParseEvent::Entry { consumed, entry } => ParseEvent::Entry {
-                consumed: consumed + n,
+                consumed: consumed.saturating_add(n),
                 entry,
             },
             ParseEvent::SparseEntry {
@@ -402,17 +402,17 @@ impl<'a> ParseEvent<'a> {
                 sparse_map,
                 real_size,
             } => ParseEvent::SparseEntry {
-                consumed: consumed + n,
+                consumed: consumed.saturating_add(n),
                 entry,
                 sparse_map,
                 real_size,
             },
             ParseEvent::GlobalExtensions { consumed, pax_data } => ParseEvent::GlobalExtensions {
-                consumed: consumed + n,
+                consumed: consumed.saturating_add(n),
                 pax_data,
             },
             ParseEvent::End { consumed } => ParseEvent::End {
-                consumed: consumed + n,
+                consumed: consumed.saturating_add(n),
             },
         }
     }
@@ -4005,6 +4005,66 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Regression test: `add_consumed` must not overflow when chained
+    /// extension headers declare very large sizes.
+    ///
+    /// With `Limits::permissive()` (`max_metadata_size = u32::MAX`),
+    /// extension headers can declare sizes close to `u32::MAX`.  When
+    /// `handle_extension` recurses and the inner call returns `NeedData`,
+    /// `add_consumed(total_size)` is applied on unwind at each level.
+    /// Before the fix, `min_bytes + n` used plain `+` and could overflow
+    /// `usize` (especially on 32-bit targets).  The fix uses
+    /// `saturating_add`.  This test verifies the parser returns `NeedData`
+    /// (or an error) without panicking.
+    #[test]
+    fn test_add_consumed_no_overflow() {
+        // First extension: a complete GNU long name ('L') with a small
+        // payload so the parser can fully consume it and recurse.
+        let long_name = b"a]long/path".to_vec();
+        let gnu_entry = make_gnu_long_name(&long_name);
+        let first_entry_size = gnu_entry.len(); // 1024 bytes (header + padded name)
+
+        // Second extension: a PAX ('x') header that declares a size close
+        // to u32::MAX.  We only provide the header—not the content—so the
+        // recursive call in handle_extension will return NeedData with
+        // min_bytes ≈ pax_size + 512.  On unwind, add_consumed adds
+        // first_entry_size, giving min_bytes ≈ pax_size + 512 + 1024.
+        // On 32-bit this would overflow without saturating_add.
+        let pax_size: u64 = u32::MAX as u64 - long_name.len() as u64 - 512;
+        let pax_header = make_header(b"PaxHeaders/file", pax_size, b'x');
+
+        // Build input: complete GNU long name entry + PAX header only (no
+        // PAX content).
+        let mut input = Vec::with_capacity(first_entry_size + HEADER_SIZE);
+        input.extend_from_slice(&gnu_entry);
+        input.extend_from_slice(&pax_header);
+
+        let mut parser = Parser::new(Limits::permissive());
+        let result = parser.parse(&input);
+
+        // The parser must not panic.  It should return NeedData (because the
+        // PAX content is missing) or an error—both are acceptable.
+        match result {
+            Ok(ParseEvent::NeedData { min_bytes }) => {
+                // min_bytes must be at least the PAX entry's total_size
+                // (header + padded content), and must not have wrapped to
+                // a small value due to overflow.
+                assert!(
+                    min_bytes > HEADER_SIZE,
+                    "min_bytes should be large, got {min_bytes}"
+                );
+            }
+            Err(_) => {
+                // An error (e.g. metadata too large) is also acceptable;
+                // the important thing is no panic from arithmetic overflow.
+            }
+            other => panic!(
+                "Expected NeedData or Err for truncated extension chain, got {:?}",
+                other
+            ),
         }
     }
 }
