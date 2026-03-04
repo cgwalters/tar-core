@@ -24,6 +24,7 @@ struct PendingMetadata {
     gnu_long_link: Option<Vec<u8>>,
     pax_extensions: Option<Vec<u8>>,
     count: usize,
+    metadata_size: u64,
 }
 
 impl PendingMetadata {
@@ -187,6 +188,7 @@ impl<R: Read> TarStreamParser<R> {
                     let gnu_long_link = self.pending.gnu_long_link.take();
                     let pax_extensions = self.pending.pax_extensions.take();
                     self.pending.count = 0;
+                    self.pending.metadata_size = 0;
 
                     let entry = self.resolve_entry_with_pending(
                         gnu_long_name,
@@ -251,23 +253,20 @@ impl<R: Read> TarStreamParser<R> {
         if self.pending.gnu_long_name.is_some() {
             return Err(ParseError::DuplicateGnuLongName);
         }
-        if size > self.limits.max_gnu_long_size {
-            return Err(ParseError::GnuLongTooLarge {
-                size,
-                limit: self.limits.max_gnu_long_size,
+        let new_metadata_size = self.pending.metadata_size + size;
+        if new_metadata_size > self.limits.max_metadata_size as u64 {
+            return Err(ParseError::MetadataTooLarge {
+                size: new_metadata_size,
+                limit: self.limits.max_metadata_size,
             });
         }
         let mut data = self.read_vec(size as usize)?;
         self.skip_bytes(padded_size - size)?;
         data.pop_if(|&mut x| x == 0);
-        if data.len() > self.limits.max_path_len {
-            return Err(ParseError::PathTooLong {
-                len: data.len(),
-                limit: self.limits.max_path_len,
-            });
-        }
+        self.limits.check_path_len(data.len())?;
         self.pending.gnu_long_name = Some(data);
         self.pending.count += 1;
+        self.pending.metadata_size = new_metadata_size;
         Ok(())
     }
 
@@ -275,23 +274,20 @@ impl<R: Read> TarStreamParser<R> {
         if self.pending.gnu_long_link.is_some() {
             return Err(ParseError::DuplicateGnuLongLink);
         }
-        if size > self.limits.max_gnu_long_size {
-            return Err(ParseError::GnuLongTooLarge {
-                size,
-                limit: self.limits.max_gnu_long_size,
+        let new_metadata_size = self.pending.metadata_size + size;
+        if new_metadata_size > self.limits.max_metadata_size as u64 {
+            return Err(ParseError::MetadataTooLarge {
+                size: new_metadata_size,
+                limit: self.limits.max_metadata_size,
             });
         }
         let mut data = self.read_vec(size as usize)?;
         self.skip_bytes(padded_size - size)?;
         data.pop_if(|&mut x| x == 0);
-        if data.len() > self.limits.max_path_len {
-            return Err(ParseError::PathTooLong {
-                len: data.len(),
-                limit: self.limits.max_path_len,
-            });
-        }
+        self.limits.check_path_len(data.len())?;
         self.pending.gnu_long_link = Some(data);
         self.pending.count += 1;
+        self.pending.metadata_size = new_metadata_size;
         Ok(())
     }
 
@@ -299,16 +295,18 @@ impl<R: Read> TarStreamParser<R> {
         if self.pending.pax_extensions.is_some() {
             return Err(ParseError::DuplicatePaxHeader);
         }
-        if size > self.limits.max_pax_size {
-            return Err(ParseError::PaxTooLarge {
-                size,
-                limit: self.limits.max_pax_size,
+        let new_metadata_size = self.pending.metadata_size + size;
+        if new_metadata_size > self.limits.max_metadata_size as u64 {
+            return Err(ParseError::MetadataTooLarge {
+                size: new_metadata_size,
+                limit: self.limits.max_metadata_size,
             });
         }
         let data = self.read_vec(size as usize)?;
         self.skip_bytes(padded_size - size)?;
         self.pending.pax_extensions = Some(data);
         self.pending.count += 1;
+        self.pending.metadata_size = new_metadata_size;
         Ok(())
     }
 
@@ -366,21 +364,11 @@ impl<R: Read> TarStreamParser<R> {
 
                 match key {
                     "path" => {
-                        if value.len() > self.limits.max_path_len {
-                            return Err(ParseError::PathTooLong {
-                                len: value.len(),
-                                limit: self.limits.max_path_len,
-                            });
-                        }
+                        self.limits.check_path_len(value.len())?;
                         path = Cow::Owned(value.to_vec());
                     }
                     "linkpath" => {
-                        if value.len() > self.limits.max_path_len {
-                            return Err(ParseError::PathTooLong {
-                                len: value.len(),
-                                limit: self.limits.max_path_len,
-                            });
-                        }
+                        self.limits.check_path_len(value.len())?;
                         link_target = Some(Cow::Owned(value.to_vec()));
                     }
                     "size" => {
@@ -431,12 +419,7 @@ impl<R: Read> TarStreamParser<R> {
             }
         }
 
-        if path.len() > self.limits.max_path_len {
-            return Err(ParseError::PathTooLong {
-                len: path.len(),
-                limit: self.limits.max_path_len,
-            });
-        }
+        self.limits.check_path_len(path.len())?;
 
         Ok(ParsedEntry {
             header_bytes: &self.header_buf,
@@ -867,7 +850,7 @@ fn test_path_too_long() {
     });
 
     let limits = Limits {
-        max_path_len: 100,
+        max_path_len: Some(100),
         ..Default::default()
     };
     let mut parser = TarStreamParser::new(Cursor::new(data), limits);
@@ -891,13 +874,13 @@ fn test_gnu_long_too_large() {
     });
 
     let limits = Limits {
-        max_gnu_long_size: 100,
+        max_metadata_size: 100,
         ..Default::default()
     };
     let mut parser = TarStreamParser::new(Cursor::new(data), limits);
 
     let err = parser.next_entry().unwrap_err();
-    assert!(matches!(err, ParseError::GnuLongTooLarge { .. }));
+    assert!(matches!(err, ParseError::MetadataTooLarge { .. }));
 }
 
 // =============================================================================

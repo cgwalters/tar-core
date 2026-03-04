@@ -82,37 +82,36 @@ use crate::{
 ///
 /// // Customize limits
 /// let strict_limits = Limits {
-///     max_path_len: 1024,
-///     max_pax_size: 64 * 1024,
+///     max_metadata_size: 64 * 1024,
+///     // Set to libc::PATH_MAX when extracting to disk
+///     max_path_len: Some(4096),
 ///     ..Default::default()
 /// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// Maximum path length in bytes.
+    /// Maximum total size of all extension metadata for a single entry, in bytes.
     ///
-    /// Applies to both file paths and link targets. Paths exceeding this
-    /// limit will cause a [`ParseError::PathTooLong`] error.
-    ///
-    /// Default: 4096 bytes (Linux PATH_MAX).
-    pub max_path_len: usize,
-
-    /// Maximum size of PAX extended header data in bytes.
-    ///
-    /// This limits the total size of a single PAX 'x' entry's content.
-    /// PAX headers larger than this will cause a [`ParseError::PaxTooLarge`] error.
+    /// This is an aggregate budget: the combined size of PAX extended headers,
+    /// GNU long name, and GNU long link data for one file entry must not exceed
+    /// this limit. Exceeding it will cause a [`ParseError::MetadataTooLarge`]
+    /// error.
     ///
     /// Default: 1 MiB (1,048,576 bytes).
-    pub max_pax_size: u64,
+    pub max_metadata_size: u32,
 
-    /// Maximum size of GNU long name/link data in bytes.
+    /// Optional maximum path length in bytes.
     ///
-    /// GNU 'L' (long name) and 'K' (long link) entries should only contain
-    /// a single path. Values exceeding this limit will cause a
-    /// [`ParseError::GnuLongTooLarge`] error.
+    /// When set, paths and link targets exceeding this limit will cause a
+    /// [`ParseError::PathTooLong`] error. When `None`, no path length check
+    /// is performed (the default).
     ///
-    /// Default: 4096 bytes.
-    pub max_gnu_long_size: u64,
+    /// Callers extracting to a real filesystem should set this to
+    /// `libc::PATH_MAX` (4096 on Linux, 1024 on macOS) or the appropriate
+    /// platform constant.
+    ///
+    /// Default: `None`.
+    pub max_path_len: Option<u32>,
 
     /// Maximum number of consecutive metadata entries before an actual entry.
     ///
@@ -146,9 +145,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_path_len: 4096,
-            max_pax_size: 1024 * 1024, // 1 MiB
-            max_gnu_long_size: 4096,
+            max_metadata_size: 1024 * 1024, // 1 MiB
+            max_path_len: None,
             max_pending_entries: 16,
             max_sparse_entries: 10_000,
             strict: true,
@@ -170,9 +168,8 @@ impl Limits {
     #[must_use]
     pub fn permissive() -> Self {
         Self {
-            max_path_len: usize::MAX,
-            max_pax_size: u64::MAX,
-            max_gnu_long_size: u64::MAX,
+            max_metadata_size: u32::MAX,
+            max_path_len: None,
             max_pending_entries: usize::MAX,
             max_sparse_entries: 1_000_000,
             strict: false,
@@ -186,13 +183,25 @@ impl Limits {
     #[must_use]
     pub fn strict() -> Self {
         Self {
-            max_path_len: 1024,
-            max_pax_size: 64 * 1024, // 64 KiB
-            max_gnu_long_size: 1024,
+            max_metadata_size: 64 * 1024, // 64 KiB
+            max_path_len: Some(4096),
             max_pending_entries: 8,
             max_sparse_entries: 1000,
             strict: true,
         }
+    }
+
+    /// Check a path length against the configured limit.
+    ///
+    /// Returns `Ok(())` if the path is within the limit (or no limit is set),
+    /// or `Err(ParseError::PathTooLong)` if it exceeds it.
+    pub fn check_path_len(&self, len: usize) -> Result<()> {
+        if let Some(limit) = self.max_path_len {
+            if len > limit as usize {
+                return Err(ParseError::PathTooLong { len, limit });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -226,25 +235,19 @@ pub enum ParseError {
         /// Actual path length.
         len: usize,
         /// Configured limit.
-        limit: usize,
+        limit: u32,
     },
 
-    /// PAX extended header exceeds configured maximum size.
-    #[error("PAX header exceeds limit: {size} bytes > {limit} bytes")]
-    PaxTooLarge {
-        /// Actual PAX header size.
+    /// Extension metadata exceeds configured maximum size.
+    ///
+    /// The aggregate size of all extension data (PAX headers, GNU long
+    /// name/link) for a single entry exceeded [`Limits::max_metadata_size`].
+    #[error("metadata exceeds limit: {size} bytes > {limit} bytes")]
+    MetadataTooLarge {
+        /// Total metadata size that would result.
         size: u64,
         /// Configured limit.
-        limit: u64,
-    },
-
-    /// GNU long name/link exceeds configured maximum size.
-    #[error("GNU long name/link exceeds limit: {size} bytes > {limit} bytes")]
-    GnuLongTooLarge {
-        /// Actual GNU long name/link size.
-        size: u64,
-        /// Configured limit.
-        limit: u64,
+        limit: u32,
     },
 
     /// Duplicate GNU long name entry without an intervening actual entry.
@@ -576,6 +579,8 @@ struct PendingMetadata<'a> {
     gnu_long_link: Option<&'a [u8]>,
     pax_extensions: Option<&'a [u8]>,
     count: usize,
+    /// Running total of all extension data bytes accumulated so far.
+    metadata_size: u64,
 }
 
 /// Context for GNU sparse entries, passed from `handle_gnu_sparse` to
@@ -881,11 +886,11 @@ impl Parser {
             // them here. Routing through emit_entry would fail because
             // global headers have arbitrary metadata fields.
             EntryType::XGlobalHeader => {
-                // Check size limit (same as local PAX headers)
-                if size > self.limits.max_pax_size {
-                    return Err(ParseError::PaxTooLarge {
+                // Check size limit
+                if size > self.limits.max_metadata_size as u64 {
+                    return Err(ParseError::MetadataTooLarge {
                         size,
-                        limit: self.limits.max_pax_size,
+                        limit: self.limits.max_metadata_size,
                     });
                 }
 
@@ -957,25 +962,12 @@ impl Parser {
             });
         }
 
-        // Check size limit
-        let max_size = match kind {
-            ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink => {
-                self.limits.max_gnu_long_size
-            }
-            ExtensionKind::Pax => self.limits.max_pax_size,
-        };
-        if size > max_size {
-            return Err(match kind {
-                ExtensionKind::GnuLongName | ExtensionKind::GnuLongLink => {
-                    ParseError::GnuLongTooLarge {
-                        size,
-                        limit: max_size,
-                    }
-                }
-                ExtensionKind::Pax => ParseError::PaxTooLarge {
-                    size,
-                    limit: max_size,
-                },
+        // Check aggregate metadata size limit
+        let new_metadata_size = slices.metadata_size + size;
+        if new_metadata_size > self.limits.max_metadata_size as u64 {
+            return Err(ParseError::MetadataTooLarge {
+                size: new_metadata_size,
+                limit: self.limits.max_metadata_size,
             });
         }
 
@@ -1001,17 +993,13 @@ impl Parser {
             if let Some(trimmed) = data.strip_suffix(&[0]) {
                 data = trimmed;
             }
-            if data.len() > self.limits.max_path_len {
-                return Err(ParseError::PathTooLong {
-                    len: data.len(),
-                    limit: self.limits.max_path_len,
-                });
-            }
+            self.limits.check_path_len(data.len())?;
         }
 
-        // Build new pending slices with the added extension data
+        // Build new pending metadata with the added extension data
         let mut new_slices = PendingMetadata {
             count: slices.count + 1,
+            metadata_size: new_metadata_size,
             ..slices
         };
         match kind {
@@ -1392,21 +1380,11 @@ impl Parser {
 
                 match key {
                     PAX_PATH => {
-                        if value.len() > self.limits.max_path_len {
-                            return Err(ParseError::PathTooLong {
-                                len: value.len(),
-                                limit: self.limits.max_path_len,
-                            });
-                        }
+                        self.limits.check_path_len(value.len())?;
                         path = Cow::Borrowed(value);
                     }
                     PAX_LINKPATH => {
-                        if value.len() > self.limits.max_path_len {
-                            return Err(ParseError::PathTooLong {
-                                len: value.len(),
-                                limit: self.limits.max_path_len,
-                            });
-                        }
+                        self.limits.check_path_len(value.len())?;
                         link_target = Some(Cow::Borrowed(value));
                     }
                     PAX_SIZE => {
@@ -1524,12 +1502,7 @@ impl Parser {
                         }
                     }
                     PAX_GNU_SPARSE_NAME => {
-                        if value.len() > self.limits.max_path_len {
-                            return Err(ParseError::PathTooLong {
-                                len: value.len(),
-                                limit: self.limits.max_path_len,
-                            });
-                        }
+                        self.limits.check_path_len(value.len())?;
                         pax_sparse_name = Some(value);
                     }
 
@@ -1571,12 +1544,7 @@ impl Parser {
         }
 
         // Validate final path length
-        if path.len() > self.limits.max_path_len {
-            return Err(ParseError::PathTooLong {
-                len: path.len(),
-                limit: self.limits.max_path_len,
-            });
-        }
+        self.limits.check_path_len(path.len())?;
 
         let entry = ParsedEntry {
             header,
@@ -1633,24 +1601,23 @@ mod tests {
     #[test]
     fn test_default_limits() {
         let limits = Limits::default();
-        assert_eq!(limits.max_path_len, 4096);
-        assert_eq!(limits.max_pax_size, 1024 * 1024);
-        assert_eq!(limits.max_gnu_long_size, 4096);
+        assert_eq!(limits.max_metadata_size, 1024 * 1024);
+        assert_eq!(limits.max_path_len, None);
         assert_eq!(limits.max_pending_entries, 16);
     }
 
     #[test]
     fn test_permissive_limits() {
         let limits = Limits::permissive();
-        assert_eq!(limits.max_path_len, usize::MAX);
-        assert_eq!(limits.max_pax_size, u64::MAX);
+        assert_eq!(limits.max_metadata_size, u32::MAX);
+        assert_eq!(limits.max_path_len, None);
     }
 
     #[test]
     fn test_strict_limits() {
         let limits = Limits::strict();
-        assert!(limits.max_path_len < Limits::default().max_path_len);
-        assert!(limits.max_pax_size < Limits::default().max_pax_size);
+        assert_eq!(limits.max_path_len, Some(4096));
+        assert!(limits.max_metadata_size < Limits::default().max_metadata_size);
     }
 
     #[test]
@@ -2291,7 +2258,7 @@ mod tests {
 
     #[test]
     fn test_parser_global_pax_header_too_large() {
-        // Global PAX header exceeding max_pax_size should error
+        // Global PAX header exceeding max_metadata_size should error
         let large_value = "x".repeat(1000);
 
         let mut archive = Vec::new();
@@ -2303,13 +2270,13 @@ mod tests {
         archive.extend(zeroes(1024));
 
         let limits = Limits {
-            max_pax_size: 100,
+            max_metadata_size: 100,
             ..Default::default()
         };
         let mut parser = Parser::new(limits);
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(ParseError::PaxTooLarge { .. })));
+        assert!(matches!(result, Err(ParseError::MetadataTooLarge { .. })));
     }
 
     #[test]
@@ -2607,13 +2574,13 @@ mod tests {
         archive.extend(zeroes(1024));
 
         let limits = Limits {
-            max_gnu_long_size: 100,
+            max_metadata_size: 100,
             ..Default::default()
         };
         let mut parser = Parser::new(limits);
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(ParseError::GnuLongTooLarge { .. })));
+        assert!(matches!(result, Err(ParseError::MetadataTooLarge { .. })));
     }
 
     #[test]
@@ -2626,7 +2593,7 @@ mod tests {
         archive.extend(zeroes(1024));
 
         let limits = Limits {
-            max_path_len: 100,
+            max_path_len: Some(100),
             ..Default::default()
         };
         let mut parser = Parser::new(limits);
@@ -2643,7 +2610,7 @@ mod tests {
 
     #[test]
     fn test_parser_pax_too_large() {
-        // Create a PAX header that exceeds the size limit
+        // Create a PAX header that exceeds the metadata size limit
         let large_value = "x".repeat(1000);
 
         let mut archive = Vec::new();
@@ -2652,13 +2619,13 @@ mod tests {
         archive.extend(zeroes(1024));
 
         let limits = Limits {
-            max_pax_size: 100,
+            max_metadata_size: 100,
             ..Default::default()
         };
         let mut parser = Parser::new(limits);
         let result = parser.parse(&archive);
 
-        assert!(matches!(result, Err(ParseError::PaxTooLarge { .. })));
+        assert!(matches!(result, Err(ParseError::MetadataTooLarge { .. })));
     }
 
     // =========================================================================
