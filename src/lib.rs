@@ -94,6 +94,15 @@ pub enum HeaderError {
         detail: String,
     },
 
+    /// Operation requires a different extension mode.
+    #[error("operation requires {required:?} extension mode, but builder is in {current:?} mode")]
+    IncompatibleMode {
+        /// The mode the operation requires.
+        required: crate::builder::ExtensionMode,
+        /// The mode the builder is currently in.
+        current: crate::builder::ExtensionMode,
+    },
+
     /// The header checksum does not match the computed value.
     #[error("checksum mismatch: expected {expected}, computed {computed}")]
     ChecksumMismatch {
@@ -1662,6 +1671,13 @@ pub const PAX_MTIME: &str = "mtime";
 pub const PAX_ATIME: &str = "atime";
 /// PAX extended header key for change time.
 pub const PAX_CTIME: &str = "ctime";
+
+// TODO: POSIX defines `hdrcharset` and `charset` PAX keys for signaling
+// non-UTF-8 header values and file data encoding respectively. No major
+// implementation (GNU tar, Go archive/tar, Rust tar crate) acts on these
+// in practice -- they all just accept raw bytes. We should add support if
+// interoperability requires it.
+
 /// PAX extended header prefix for SCHILY extended attributes.
 pub const PAX_SCHILY_XATTR: &str = "SCHILY.xattr.";
 
@@ -2270,6 +2286,18 @@ mod tests {
         let data = "35 path=日本語/ファイル.txt\n".as_bytes();
         let pax = PaxExtensions::new(data);
         assert_eq!(pax.get("path"), Some("日本語/ファイル.txt"));
+    }
+
+    #[test]
+    fn test_pax_non_utf8_value() {
+        // PAX values may contain non-UTF-8 bytes in practice.
+        // value() should fail but value_bytes() should preserve them.
+        let record = b"25 path=etc/\x80\xfe\xff/file.txt\n";
+        let mut pax = PaxExtensions::new(record);
+        let ext = pax.next().unwrap().unwrap();
+        assert_eq!(ext.key().unwrap(), "path");
+        assert!(ext.value().is_err(), "non-UTF-8 value should fail value()");
+        assert_eq!(ext.value_bytes(), b"etc/\x80\xfe\xff/file.txt");
     }
 
     #[test]
@@ -4084,7 +4112,8 @@ mod tests {
                         .mtime(params.mtime)
                         .unwrap()
                         .entry_type(EntryType::Regular)
-                        .add_pax(&params.xattr_key, params.xattr_value.as_bytes());
+                        .add_pax(&params.xattr_key, params.xattr_value.as_bytes())
+                        .unwrap();
 
                     builder.finish()
                 }

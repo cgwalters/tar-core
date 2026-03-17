@@ -863,11 +863,23 @@ impl EntryBuilder {
     /// Add a custom PAX extension record.
     ///
     /// This is useful for adding metadata that doesn't fit in standard
-    /// header fields. The PAX extension will be emitted regardless of
-    /// the extension mode setting.
-    pub fn add_pax(&mut self, key: &str, value: impl AsRef<[u8]>) -> &mut Self {
+    /// header fields (e.g. extended attributes, high-precision timestamps).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeaderError::IncompatibleMode`] if the extension mode is
+    /// [`ExtensionMode::Gnu`]. PAX records are only emitted in PAX mode;
+    /// call [`Self::set_extension_mode`] first or use [`Self::new_ustar`]
+    /// to create a PAX-mode builder.
+    pub fn add_pax(&mut self, key: &str, value: impl AsRef<[u8]>) -> Result<&mut Self> {
+        if self.mode != ExtensionMode::Pax {
+            return Err(HeaderError::IncompatibleMode {
+                required: ExtensionMode::Pax,
+                current: self.mode,
+            });
+        }
         self.pax_mut().add(key, value);
-        self
+        Ok(self)
     }
 
     /// Get or create the PAX builder for this entry.
@@ -1861,6 +1873,7 @@ mod tests {
             .size(0)
             .unwrap()
             .add_pax("SCHILY.xattr.user.test", b"value")
+            .unwrap()
             .entry_type(EntryType::Regular);
 
         assert!(builder.needs_extension()); // Due to custom PAX
@@ -1874,6 +1887,40 @@ mod tests {
         let pax_data = blocks[1].as_bytes();
         let pax_str = String::from_utf8_lossy(pax_data);
         assert!(pax_str.contains("SCHILY.xattr.user.test=value"));
+    }
+
+    #[test]
+    fn test_add_pax_rejects_gnu_mode() {
+        let mut builder = EntryBuilder::new_gnu();
+        let result = builder.add_pax("SCHILY.xattr.user.test", b"value");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("Pax"),
+            "error should mention Pax mode: {err}"
+        );
+    }
+
+    #[test]
+    fn test_add_pax_after_mode_switch() {
+        // Switching from GNU to PAX mode should allow add_pax().
+        let mut builder = EntryBuilder::new_gnu();
+        assert!(builder.add_pax("key", b"val").is_err());
+
+        builder.set_extension_mode(ExtensionMode::Pax);
+        builder
+            .path(b"file.txt")
+            .mode(0o644)
+            .unwrap()
+            .size(0)
+            .unwrap()
+            .add_pax("SCHILY.xattr.user.test", b"value")
+            .unwrap();
+
+        let blocks = builder.finish();
+        // Should have PAX 'x' header + PAX data + main header
+        assert!(blocks.len() >= 3);
+        assert_eq!(blocks[0].entry_type(), EntryType::XHeader);
     }
 
     #[test]

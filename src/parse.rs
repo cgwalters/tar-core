@@ -2005,6 +2005,93 @@ mod tests {
     }
 
     #[test]
+    #[allow(invalid_from_utf8)]
+    fn test_parser_pax_non_utf8_path() {
+        // Non-UTF-8 bytes in PAX path values are accepted, matching the
+        // pragmatic behavior of Go's archive/tar and the Rust tar crate.
+        // The POSIX spec says PAX path values SHOULD be UTF-8, but real-world
+        // archives (e.g. from Docker/BuildKit) may contain non-UTF-8 paths.
+        // See bootc-dev/bootc#2073 for a concrete example.
+        let non_utf8_path: &[u8] = b"etc/ssl/certs/F\xf5tan\xfas\xedtv\xe1ny.pem";
+        assert!(
+            core::str::from_utf8(non_utf8_path).is_err(),
+            "test data must be non-UTF-8"
+        );
+
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[("path", non_utf8_path)]));
+        archive.extend_from_slice(&make_header(b"placeholder.pem", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.path.as_ref(), non_utf8_path);
+                // The lossy accessor should replace invalid bytes
+                let lossy = entry.path_lossy();
+                assert!(
+                    lossy.contains('\u{FFFD}'),
+                    "lossy conversion should have replacement chars"
+                );
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pax_non_utf8_path_roundtrip() {
+        // Verify that a non-UTF-8 PAX path survives a builder -> parser
+        // roundtrip. The path must exceed 100 bytes to trigger PAX emission.
+        use crate::builder::EntryBuilder;
+
+        // 101+ byte path with non-UTF-8 bytes embedded
+        let mut long_path =
+            b"a/very/deep/directory/structure/that/needs/to/exceed/one/hundred/bytes/\xf0\xf1\xf2/"
+                .to_vec();
+        long_path.extend(b"and/some/more/nested/dirs/to/be/safe/file.bin");
+        assert!(long_path.len() > 100, "path must exceed 100 bytes");
+        assert!(
+            core::str::from_utf8(&long_path).is_err(),
+            "path must contain non-UTF-8"
+        );
+
+        let mut builder = EntryBuilder::new_ustar();
+        builder
+            .path(&long_path)
+            .mode(0o644)
+            .unwrap()
+            .size(5)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap();
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&builder.finish_bytes());
+        // 5 bytes of content, padded to 512
+        let mut content_block = [0u8; 512];
+        content_block[..5].copy_from_slice(b"hello");
+        archive.extend_from_slice(&content_block);
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.path.as_ref(), long_path.as_slice());
+                assert_eq!(entry.size, 5);
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parser_pax_size_override() {
         // PAX header should override the size in the actual header
         let mut archive = Vec::new();
@@ -2181,6 +2268,29 @@ mod tests {
                     entry.link_target.as_ref().unwrap().as_ref(),
                     pax_linkpath.as_bytes()
                 );
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[allow(invalid_from_utf8)]
+    fn test_parser_pax_non_utf8_linkpath() {
+        // Non-UTF-8 bytes in PAX linkpath values should be preserved.
+        let non_utf8_target: &[u8] = b"targets/\xc0\xc1invalid.so";
+        assert!(core::str::from_utf8(non_utf8_target).is_err());
+
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[("linkpath", non_utf8_target)]));
+        archive.extend_from_slice(&make_header(b"link.so", 0, b'2')); // symlink
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.link_target.as_deref(), Some(non_utf8_target.as_ref()));
             }
             other => panic!("Expected Entry, got {:?}", other),
         }
@@ -2447,6 +2557,79 @@ mod tests {
         match event {
             ParseEvent::Entry { entry, .. } => {
                 // PAX path should override GNU long name
+                assert_eq!(entry.path.as_ref(), pax_path.as_bytes());
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_pax_before_gnu_long_name() {
+        // PAX 'x' -> GNU 'L' -> real entry: this is what tar-rs's builder
+        // produces when you call append_pax_extensions() (e.g. for xattrs)
+        // followed by append_data() with a long path. The PAX metadata
+        // should still be associated with the real entry, and PAX path
+        // (if present) should take precedence over the GNU long name.
+        //
+        // This ordering matters for ecosystem compatibility with bootc
+        // (see bootc-dev/bootc#2073).
+        let gnu_name =
+            "gnu/long/name/that/exceeds/one/hundred/bytes/".to_string() + &"g".repeat(60);
+        let xattr_value = b"some xattr value";
+
+        let mut archive = Vec::new();
+        // PAX header first (with xattr but no path -- simulating bootc's
+        // copy_entry which strips path/linkpath from PAX)
+        archive.extend(make_pax_header(&[(
+            "SCHILY.xattr.user.test",
+            xattr_value.as_slice(),
+        )]));
+        // GNU long name second
+        archive.extend(make_gnu_long_name(gnu_name.as_bytes()));
+        // Real entry last
+        archive.extend_from_slice(&make_header(b"placeholder", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                // GNU long name should be used (no PAX path to override it)
+                assert_eq!(entry.path.as_ref(), gnu_name.as_bytes());
+                // PAX xattr should still be preserved
+                assert!(entry.pax.is_some());
+                let pax = PaxExtensions::new(entry.pax.unwrap());
+                let xattr = pax
+                    .filter_map(|e| e.ok())
+                    .find(|e| e.key_bytes().starts_with(b"SCHILY.xattr."));
+                assert!(xattr.is_some(), "xattr should be preserved");
+                assert_eq!(xattr.unwrap().value_bytes(), xattr_value);
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_pax_path_overrides_gnu_long_name_reversed_order() {
+        // Same as test_parser_combined_gnu_pax but with reversed ordering:
+        // PAX 'x' (with path) -> GNU 'L' -> real entry.
+        // PAX path should still win regardless of order.
+        let gnu_name = "gnu/long/name/".to_string() + &"g".repeat(100);
+        let pax_path = "pax/should/still/win/file.txt";
+
+        let mut archive = Vec::new();
+        // PAX first this time (reversed from test_parser_combined_gnu_pax)
+        archive.extend(make_pax_header(&[("path", pax_path.as_bytes())]));
+        archive.extend(make_gnu_long_name(gnu_name.as_bytes()));
+        archive.extend_from_slice(&make_header(b"header.txt", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
                 assert_eq!(entry.path.as_ref(), pax_path.as_bytes());
             }
             other => panic!("Expected Entry, got {:?}", other),
