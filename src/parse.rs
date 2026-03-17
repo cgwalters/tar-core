@@ -2005,6 +2005,93 @@ mod tests {
     }
 
     #[test]
+    #[allow(invalid_from_utf8)]
+    fn test_parser_pax_non_utf8_path() {
+        // Non-UTF-8 bytes in PAX path values are accepted, matching the
+        // pragmatic behavior of Go's archive/tar and the Rust tar crate.
+        // The POSIX spec says PAX path values SHOULD be UTF-8, but real-world
+        // archives (e.g. from Docker/BuildKit) may contain non-UTF-8 paths.
+        // See bootc-dev/bootc#2073 for a concrete example.
+        let non_utf8_path: &[u8] = b"etc/ssl/certs/F\xf5tan\xfas\xedtv\xe1ny.pem";
+        assert!(
+            core::str::from_utf8(non_utf8_path).is_err(),
+            "test data must be non-UTF-8"
+        );
+
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[("path", non_utf8_path)]));
+        archive.extend_from_slice(&make_header(b"placeholder.pem", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.path.as_ref(), non_utf8_path);
+                // The lossy accessor should replace invalid bytes
+                let lossy = entry.path_lossy();
+                assert!(
+                    lossy.contains('\u{FFFD}'),
+                    "lossy conversion should have replacement chars"
+                );
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pax_non_utf8_path_roundtrip() {
+        // Verify that a non-UTF-8 PAX path survives a builder -> parser
+        // roundtrip. The path must exceed 100 bytes to trigger PAX emission.
+        use crate::builder::EntryBuilder;
+
+        // 101+ byte path with non-UTF-8 bytes embedded
+        let mut long_path =
+            b"a/very/deep/directory/structure/that/needs/to/exceed/one/hundred/bytes/\xf0\xf1\xf2/"
+                .to_vec();
+        long_path.extend(b"and/some/more/nested/dirs/to/be/safe/file.bin");
+        assert!(long_path.len() > 100, "path must exceed 100 bytes");
+        assert!(
+            core::str::from_utf8(&long_path).is_err(),
+            "path must contain non-UTF-8"
+        );
+
+        let mut builder = EntryBuilder::new_ustar();
+        builder
+            .path(&long_path)
+            .mode(0o644)
+            .unwrap()
+            .size(5)
+            .unwrap()
+            .mtime(0)
+            .unwrap()
+            .uid(0)
+            .unwrap()
+            .gid(0)
+            .unwrap();
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(&builder.finish_bytes());
+        // 5 bytes of content, padded to 512
+        let mut content_block = [0u8; 512];
+        content_block[..5].copy_from_slice(b"hello");
+        archive.extend_from_slice(&content_block);
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.path.as_ref(), long_path.as_slice());
+                assert_eq!(entry.size, 5);
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parser_pax_size_override() {
         // PAX header should override the size in the actual header
         let mut archive = Vec::new();
@@ -2181,6 +2268,29 @@ mod tests {
                     entry.link_target.as_ref().unwrap().as_ref(),
                     pax_linkpath.as_bytes()
                 );
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    #[allow(invalid_from_utf8)]
+    fn test_parser_pax_non_utf8_linkpath() {
+        // Non-UTF-8 bytes in PAX linkpath values should be preserved.
+        let non_utf8_target: &[u8] = b"targets/\xc0\xc1invalid.so";
+        assert!(core::str::from_utf8(non_utf8_target).is_err());
+
+        let mut archive = Vec::new();
+        archive.extend(make_pax_header(&[("linkpath", non_utf8_target)]));
+        archive.extend_from_slice(&make_header(b"link.so", 0, b'2')); // symlink
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.link_target.as_deref(), Some(non_utf8_target.as_ref()));
             }
             other => panic!("Expected Entry, got {:?}", other),
         }
