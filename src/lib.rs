@@ -94,6 +94,15 @@ pub enum HeaderError {
         detail: String,
     },
 
+    /// Operation requires a different extension mode.
+    #[error("operation requires {required:?} extension mode, but builder is in {current:?} mode")]
+    IncompatibleMode {
+        /// The mode the operation requires.
+        required: crate::builder::ExtensionMode,
+        /// The mode the builder is currently in.
+        current: crate::builder::ExtensionMode,
+    },
+
     /// The header checksum does not match the computed value.
     #[error("checksum mismatch: expected {expected}, computed {computed}")]
     ChecksumMismatch {
@@ -4103,7 +4112,8 @@ mod tests {
                         .mtime(params.mtime)
                         .unwrap()
                         .entry_type(EntryType::Regular)
-                        .add_pax(&params.xattr_key, params.xattr_value.as_bytes());
+                        .add_pax(&params.xattr_key, params.xattr_value.as_bytes())
+                        .unwrap();
 
                     builder.finish()
                 }

@@ -272,7 +272,9 @@ fn main() {
             .unwrap()
             .size(0)
             .unwrap();
-        builder.add_pax("SCHILY.xattr.user.test", b"value123");
+        builder
+            .add_pax("SCHILY.xattr.user.test", b"value123")
+            .unwrap();
         let hdr = builder.finish_bytes();
         let mut archive = hdr;
         archive.extend_from_slice(&EOA);
@@ -292,10 +294,12 @@ fn main() {
             .unwrap()
             .mtime(9999999999)
             .unwrap();
-        builder.add_pax(
-            "SCHILY.xattr.security.selinux",
-            b"system_u:object_r:usr_t:s0",
-        );
+        builder
+            .add_pax(
+                "SCHILY.xattr.security.selinux",
+                b"system_u:object_r:usr_t:s0",
+            )
+            .unwrap();
         let hdr = builder.finish_bytes();
         let mut archive = hdr;
         archive.extend_from_slice(b"payload");
@@ -512,7 +516,7 @@ fn main() {
             .unwrap()
             .mtime(1700000000)
             .unwrap();
-        builder.add_pax("mtime", b"1700000000.123456789");
+        builder.add_pax("mtime", b"1700000000.123456789").unwrap();
         let hdr = builder.finish_bytes();
         let mut archive = hdr;
         archive.extend_from_slice(&EOA);
