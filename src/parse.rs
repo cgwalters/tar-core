@@ -2564,6 +2564,79 @@ mod tests {
     }
 
     #[test]
+    fn test_parser_pax_before_gnu_long_name() {
+        // PAX 'x' -> GNU 'L' -> real entry: this is what tar-rs's builder
+        // produces when you call append_pax_extensions() (e.g. for xattrs)
+        // followed by append_data() with a long path. The PAX metadata
+        // should still be associated with the real entry, and PAX path
+        // (if present) should take precedence over the GNU long name.
+        //
+        // This ordering matters for ecosystem compatibility with bootc
+        // (see bootc-dev/bootc#2073).
+        let gnu_name =
+            "gnu/long/name/that/exceeds/one/hundred/bytes/".to_string() + &"g".repeat(60);
+        let xattr_value = b"some xattr value";
+
+        let mut archive = Vec::new();
+        // PAX header first (with xattr but no path -- simulating bootc's
+        // copy_entry which strips path/linkpath from PAX)
+        archive.extend(make_pax_header(&[(
+            "SCHILY.xattr.user.test",
+            xattr_value.as_slice(),
+        )]));
+        // GNU long name second
+        archive.extend(make_gnu_long_name(gnu_name.as_bytes()));
+        // Real entry last
+        archive.extend_from_slice(&make_header(b"placeholder", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                // GNU long name should be used (no PAX path to override it)
+                assert_eq!(entry.path.as_ref(), gnu_name.as_bytes());
+                // PAX xattr should still be preserved
+                assert!(entry.pax.is_some());
+                let pax = PaxExtensions::new(entry.pax.unwrap());
+                let xattr = pax
+                    .filter_map(|e| e.ok())
+                    .find(|e| e.key_bytes().starts_with(b"SCHILY.xattr."));
+                assert!(xattr.is_some(), "xattr should be preserved");
+                assert_eq!(xattr.unwrap().value_bytes(), xattr_value);
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parser_pax_path_overrides_gnu_long_name_reversed_order() {
+        // Same as test_parser_combined_gnu_pax but with reversed ordering:
+        // PAX 'x' (with path) -> GNU 'L' -> real entry.
+        // PAX path should still win regardless of order.
+        let gnu_name = "gnu/long/name/".to_string() + &"g".repeat(100);
+        let pax_path = "pax/should/still/win/file.txt";
+
+        let mut archive = Vec::new();
+        // PAX first this time (reversed from test_parser_combined_gnu_pax)
+        archive.extend(make_pax_header(&[("path", pax_path.as_bytes())]));
+        archive.extend(make_gnu_long_name(gnu_name.as_bytes()));
+        archive.extend_from_slice(&make_header(b"header.txt", 0, b'0'));
+        archive.extend(zeroes(1024));
+
+        let mut parser = Parser::new(Limits::default());
+        let event = parser.parse(&archive).unwrap();
+
+        match event {
+            ParseEvent::Entry { entry, .. } => {
+                assert_eq!(entry.path.as_ref(), pax_path.as_bytes());
+            }
+            other => panic!("Expected Entry, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_parser_gnu_long_name_and_link_combined() {
         // Both GNU long name and long link for the same entry
         let long_name = "long/symlink/name/".to_string() + &"n".repeat(100);
