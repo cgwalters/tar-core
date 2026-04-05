@@ -43,7 +43,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
       - name: CI (check + test)
@@ -89,7 +89,7 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -100,7 +100,7 @@ jobs:
         run: just fuzz-all
       - name: Upload fuzz artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts
           path: |
