@@ -1083,3 +1083,210 @@ mod proptest_tests {
         }
     }
 }
+
+// =============================================================================
+// GNU/POSIX record-size padding tests
+// =============================================================================
+
+/// GNU tar default record size: 20 blocks × 512 bytes = 10,240 bytes.
+const GNU_RECORD_SIZE: usize = 20 * HEADER_SIZE;
+
+/// Pad a tar archive to the given total size by appending zero bytes.
+///
+/// `target_size` must be >= `data.len()` and a multiple of `HEADER_SIZE`.
+fn pad_to(data: Vec<u8>, target_size: usize) -> Vec<u8> {
+    assert_eq!(
+        target_size % HEADER_SIZE,
+        0,
+        "target_size {target_size} is not a multiple of HEADER_SIZE {HEADER_SIZE}",
+    );
+    assert!(
+        target_size >= data.len(),
+        "target_size {target_size} < data.len() {}",
+        data.len()
+    );
+    let mut out = data;
+    out.resize(target_size, 0u8);
+    out
+}
+
+#[test]
+fn test_gnu_record_size_padding() {
+    // Build a minimal archive with one file then pad it to GNU_RECORD_SIZE.
+    let base = create_tar_with(|b| {
+        append_file(b, "hello.txt", b"hello");
+    });
+    // The base archive must be <= GNU_RECORD_SIZE to be paddable.
+    assert!(
+        base.len() <= GNU_RECORD_SIZE,
+        "base archive too large: {} bytes",
+        base.len()
+    );
+    let data = pad_to(base, GNU_RECORD_SIZE);
+    assert_eq!(data.len(), GNU_RECORD_SIZE);
+
+    // Must parse exactly 1 entry with no error under all chunk sizes.
+    for &(seed, mc) in TEST_READ_PARAMS {
+        let entries = parse_all_chunked(&data, seed, mc);
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected 1 entry (seed={seed}, max_chunk={mc})"
+        );
+        assert_eq!(
+            entries[0].path, b"hello.txt",
+            "wrong path (seed={seed}, max_chunk={mc})"
+        );
+    }
+}
+
+#[test]
+fn test_gnu_record_size_padding_sans_io() {
+    use tar_core::parse::{ParseEvent, Parser};
+
+    let base = create_tar_with(|b| {
+        append_file(b, "hello.txt", b"hello");
+    });
+    let data = pad_to(base, GNU_RECORD_SIZE);
+
+    let mut parser = Parser::new(Limits::default());
+    let mut offset = 0usize;
+    let mut entry_count = 0usize;
+
+    loop {
+        match parser.parse(&data[offset..]).expect("parse should succeed") {
+            ParseEvent::NeedData { .. } => panic!("unexpected NeedData"),
+            ParseEvent::Entry { consumed, entry } => {
+                entry_count += 1;
+                let padded = entry.padded_size() as usize;
+                // Verify path before the entry is dropped.
+                assert_eq!(entry.path.as_ref(), b"hello.txt");
+                offset += consumed + padded;
+            }
+            ParseEvent::SparseEntry {
+                consumed, entry, ..
+            } => {
+                entry_count += 1;
+                offset += consumed + entry.padded_size() as usize;
+            }
+            ParseEvent::GlobalExtensions { consumed, .. } => {
+                offset += consumed;
+            }
+            ParseEvent::End { consumed } => {
+                // The consumed count should cover all padding through GNU_RECORD_SIZE.
+                assert_eq!(
+                    offset + consumed,
+                    GNU_RECORD_SIZE,
+                    "End consumed should cover the full padded archive"
+                );
+                break;
+            }
+        }
+    }
+
+    assert_eq!(entry_count, 1, "expected 1 entry from sans-IO parser");
+}
+
+#[test]
+fn test_record_padding_various_sizes() {
+    // Test different total archive sizes (all zero-padded from the end-of-archive marker).
+    let base = create_tar_with(|b| {
+        append_file(b, "test.txt", b"data");
+    });
+
+    let base_len = base.len();
+
+    // Round up base_len to the next multiple of HEADER_SIZE.
+    let min_target = base_len.next_multiple_of(HEADER_SIZE);
+
+    // Try several target sizes that are >= base_len and multiples of HEADER_SIZE.
+    let target_block_counts = [
+        min_target / HEADER_SIZE, // minimum: just enough to hold the base
+        5,
+        20, // GNU_RECORD_SIZE / HEADER_SIZE
+        21,
+    ];
+
+    for &block_count in &target_block_counts {
+        let target = block_count * HEADER_SIZE;
+        if target < base_len {
+            // Skip targets smaller than the archive itself.
+            continue;
+        }
+        let data = pad_to(base.clone(), target);
+        assert_eq!(data.len(), target);
+
+        for &(seed, mc) in TEST_READ_PARAMS {
+            let entries = parse_all_chunked(&data, seed, mc);
+            assert_eq!(
+                entries.len(),
+                1,
+                "expected 1 entry with {block_count} blocks of padding (seed={seed}, max_chunk={mc})"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_real_gnu_tar_padding() {
+    use std::process::Command;
+
+    // Check if `tar` is available.
+    let tar_available = Command::new("tar")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !tar_available {
+        eprintln!("skipping test_real_gnu_tar_padding: tar not available");
+        return;
+    }
+
+    // Create a temp directory with one file, then build a real GNU tar archive.
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let file_path = tmp.path().join("hello.txt");
+    std::fs::write(&file_path, b"hello from real tar").expect("write test file");
+
+    let tar_path = tmp.path().join("test.tar");
+
+    // Build a PAX-format tar archive with the default record size (20 blocks).
+    let status = Command::new("tar")
+        .args([
+            "--format=pax",
+            "-cf",
+            tar_path.to_str().unwrap(),
+            "-C",
+            tmp.path().to_str().unwrap(),
+            "hello.txt",
+        ])
+        .status()
+        .expect("run tar");
+
+    if !status.success() {
+        eprintln!("skipping test_real_gnu_tar_padding: tar failed to create archive");
+        return;
+    }
+
+    let data = std::fs::read(&tar_path).expect("read tar archive");
+
+    assert!(
+        data.len() % HEADER_SIZE == 0,
+        "archive not aligned to block size: {} bytes",
+        data.len()
+    );
+
+    // Parse with all chunk sizes — must succeed with exactly 1 entry.
+    for &(seed, mc) in TEST_READ_PARAMS {
+        let entries = parse_all_chunked(&data, seed, mc);
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected 1 entry from real GNU tar archive (seed={seed}, max_chunk={mc})"
+        );
+        assert_eq!(
+            entries[0].path, b"hello.txt",
+            "wrong path (seed={seed}, max_chunk={mc})"
+        );
+    }
+}
