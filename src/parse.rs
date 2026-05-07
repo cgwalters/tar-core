@@ -830,9 +830,15 @@ impl Parser {
                 if !slices.is_empty() {
                     return Err(ParseError::OrphanedMetadata);
                 }
-                return Ok(ParseEvent::End {
-                    consumed: 2 * HEADER_SIZE,
-                });
+                // Consume the two mandatory EOA blocks plus any additional
+                // record-size padding (GNU tar pads to 20×512, Go's archive/tar
+                // pads to 4×512, etc.).
+                let consumed = input
+                    .chunks_exact(HEADER_SIZE)
+                    .take_while(|block| block.iter().all(|&b| b == 0))
+                    .count()
+                    * HEADER_SIZE;
+                return Ok(ParseEvent::End { consumed });
             }
             // Not end of archive — single stray zero block; skip it and
             // continue with the next block as a header.
@@ -1697,9 +1703,16 @@ mod tests {
             other => panic!("Expected Entry, got {:?}", other),
         }
 
-        // Now parse end
+        // Now parse end — consumed must be >= 1024 (two EOA blocks) and
+        // may include additional trailing zeros from the 2048-byte buffer.
         let event = parser.parse(&data[512..]).unwrap();
-        assert!(matches!(event, ParseEvent::End { consumed: 1024 }));
+        match event {
+            ParseEvent::End { consumed } => assert!(
+                consumed >= 1024,
+                "expected consumed >= 1024, got {consumed}"
+            ),
+            other => panic!("Expected End, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1743,9 +1756,16 @@ mod tests {
         // Content at data[512..517], padded to 512.
         // Caller skips past content + padding, then parses the next header.
 
-        // Parse end (zero blocks at 1024..2048)
+        // Parse end (zero blocks at 1024..2048) — consumed must be >= 1024
+        // and may include additional trailing zeros from the 2560-byte buffer.
         let event = parser.parse(&data[1024..]).unwrap();
-        assert!(matches!(event, ParseEvent::End { consumed: 1024 }));
+        match event {
+            ParseEvent::End { consumed } => assert!(
+                consumed >= 1024,
+                "expected consumed >= 1024, got {consumed}"
+            ),
+            other => panic!("Expected End, got {:?}", other),
+        }
     }
 
     // =========================================================================
